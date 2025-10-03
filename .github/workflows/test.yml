@@ -266,19 +266,6 @@ jobs:
       working-directory: src
       run: ./tool/go version
 
-    - name: test
-      if: matrix.key != 'win-bench' && matrix.key != 'win-tool-go' # skip on bench builder
-      working-directory: src
-      run: go run ./cmd/testwrapper sharded:${{ matrix.shard }}
-
-    - name: bench all
-      if: matrix.key == 'win-bench'
-      working-directory: src
-      # Don't use -bench=. -benchtime=1x.
-      # Somewhere in the layers (powershell?)
-      # the equals signs cause great confusion.
-      run: go test ./... -bench . -benchtime 1x -run "^$"
-
     - name: Build Windows binaries
       if: matrix.key == 'win-shard-1-2'
       working-directory: src
@@ -294,6 +281,19 @@ jobs:
         path: |
           src/tailscale.exe
           src/tailscaled.exe
+
+    - name: test
+      if: matrix.key != 'win-bench' && matrix.key != 'win-tool-go' # skip on bench builder
+      working-directory: src
+      run: go run ./cmd/testwrapper sharded:${{ matrix.shard }}
+
+    - name: bench all
+      if: matrix.key == 'win-bench'
+      working-directory: src
+      # Don't use -bench=. -benchtime=1x.
+      # Somewhere in the layers (powershell?)
+      # the equals signs cause great confusion.
+      run: go test ./... -bench . -benchtime 1x -run "^$"
 
     - name: Tidy cache
       if: matrix.key != 'win-tool-go'
