@@ -1,9 +1,9 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
-// Package connstats maintains statistics about connections
-// flowing through a TUN device (which operate at the IP layer).
-package connstats
+//go:build !ts_omit_netlog && !ts_omit_logtail
+
+package netlog
 
 import (
 	"context"
@@ -14,13 +14,14 @@ import (
 	"golang.org/x/sync/errgroup"
 	"tailscale.com/net/packet"
 	"tailscale.com/net/tsaddr"
+	"tailscale.com/types/ipproto"
 	"tailscale.com/types/netlogtype"
 )
 
-// Statistics maintains counters for every connection.
+// statistics maintains counters for every connection.
 // All methods are safe for concurrent use.
 // The zero value is ready for use.
-type Statistics struct {
+type statistics struct {
 	maxConns int // immutable once set
 
 	mu sync.Mutex
@@ -39,13 +40,13 @@ type connCnts struct {
 	physical map[netlogtype.Connection]netlogtype.Counts
 }
 
-// NewStatistics creates a data structure for tracking connection statistics
+// newStatistics creates a data structure for tracking connection statistics
 // that periodically dumps the virtual and physical connection counts
 // depending on whether the maxPeriod or maxConns is exceeded.
 // The dump function is called from a single goroutine.
 // Shutdown must be called to cleanup resources.
-func NewStatistics(maxPeriod time.Duration, maxConns int, dump func(start, end time.Time, virtual, physical map[netlogtype.Connection]netlogtype.Counts)) *Statistics {
-	s := &Statistics{maxConns: maxConns}
+func newStatistics(maxPeriod time.Duration, maxConns int, dump func(start, end time.Time, virtual, physical map[netlogtype.Connection]netlogtype.Counts)) *statistics {
+	s := &statistics{maxConns: maxConns}
 	s.connCntsCh = make(chan connCnts, 256)
 	s.shutdownCtx, s.shutdown = context.WithCancel(context.Background())
 	s.group.Go(func() error {
@@ -82,15 +83,19 @@ func NewStatistics(maxPeriod time.Duration, maxConns int, dump func(start, end t
 // UpdateTxVirtual updates the counters for a transmitted IP packet
 // The source and destination of the packet directly correspond with
 // the source and destination in netlogtype.Connection.
-func (s *Statistics) UpdateTxVirtual(b []byte) {
-	s.updateVirtual(b, false)
+func (s *statistics) UpdateTxVirtual(b []byte) {
+	var p packet.Parsed
+	p.Decode(b)
+	s.UpdateVirtual(p.IPProto, p.Src, p.Dst, 1, len(b), false)
 }
 
 // UpdateRxVirtual updates the counters for a received IP packet.
 // The source and destination of the packet are inverted with respect to
 // the source and destination in netlogtype.Connection.
-func (s *Statistics) UpdateRxVirtual(b []byte) {
-	s.updateVirtual(b, true)
+func (s *statistics) UpdateRxVirtual(b []byte) {
+	var p packet.Parsed
+	p.Decode(b)
+	s.UpdateVirtual(p.IPProto, p.Dst, p.Src, 1, len(b), true)
 }
 
 var (
@@ -98,22 +103,17 @@ var (
 	tailscaleServiceIPv6 = tsaddr.TailscaleServiceIPv6()
 )
 
-func (s *Statistics) updateVirtual(b []byte, receive bool) {
-	var p packet.Parsed
-	p.Decode(b)
-	conn := netlogtype.Connection{Proto: p.IPProto, Src: p.Src, Dst: p.Dst}
-	if receive {
-		conn.Src, conn.Dst = conn.Dst, conn.Src
-	}
-
+func (s *statistics) UpdateVirtual(proto ipproto.Proto, src, dst netip.AddrPort, packets, bytes int, receive bool) {
 	// Network logging is defined as traffic between two Tailscale nodes.
 	// Traffic with the internal Tailscale service is not with another node
 	// and should not be logged. It also happens to be a high volume
 	// amount of discrete traffic flows (e.g., DNS lookups).
-	switch conn.Dst.Addr() {
+	switch dst.Addr() {
 	case tailscaleServiceIPv4, tailscaleServiceIPv6:
 		return
 	}
+
+	conn := netlogtype.Connection{Proto: proto, Src: src, Dst: dst}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -122,11 +122,11 @@ func (s *Statistics) updateVirtual(b []byte, receive bool) {
 		return
 	}
 	if receive {
-		cnts.RxPackets++
-		cnts.RxBytes += uint64(len(b))
+		cnts.RxPackets += uint64(packets)
+		cnts.RxBytes += uint64(bytes)
 	} else {
-		cnts.TxPackets++
-		cnts.TxBytes += uint64(len(b))
+		cnts.TxPackets += uint64(packets)
+		cnts.TxBytes += uint64(bytes)
 	}
 	s.virtual[conn] = cnts
 }
@@ -135,20 +135,20 @@ func (s *Statistics) updateVirtual(b []byte, receive bool) {
 // The src is always a Tailscale IP address, representing some remote peer.
 // The dst is a remote IP address and port that corresponds
 // with some physical peer backing the Tailscale IP address.
-func (s *Statistics) UpdateTxPhysical(src netip.Addr, dst netip.AddrPort, packets, bytes int) {
-	s.updatePhysical(src, dst, packets, bytes, false)
+func (s *statistics) UpdateTxPhysical(src netip.Addr, dst netip.AddrPort, packets, bytes int) {
+	s.UpdatePhysical(0, netip.AddrPortFrom(src, 0), dst, packets, bytes, false)
 }
 
 // UpdateRxPhysical updates the counters for zero or more received wireguard packets.
 // The src is always a Tailscale IP address, representing some remote peer.
 // The dst is a remote IP address and port that corresponds
 // with some physical peer backing the Tailscale IP address.
-func (s *Statistics) UpdateRxPhysical(src netip.Addr, dst netip.AddrPort, packets, bytes int) {
-	s.updatePhysical(src, dst, packets, bytes, true)
+func (s *statistics) UpdateRxPhysical(src netip.Addr, dst netip.AddrPort, packets, bytes int) {
+	s.UpdatePhysical(0, netip.AddrPortFrom(src, 0), dst, packets, bytes, true)
 }
 
-func (s *Statistics) updatePhysical(src netip.Addr, dst netip.AddrPort, packets, bytes int, receive bool) {
-	conn := netlogtype.Connection{Src: netip.AddrPortFrom(src, 0), Dst: dst}
+func (s *statistics) UpdatePhysical(proto ipproto.Proto, src, dst netip.AddrPort, packets, bytes int, receive bool) {
+	conn := netlogtype.Connection{Proto: proto, Src: src, Dst: dst}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -168,7 +168,7 @@ func (s *Statistics) updatePhysical(src netip.Addr, dst netip.AddrPort, packets,
 
 // preInsertConn updates the maps to handle insertion of a new connection.
 // It reports false if insertion is not allowed (i.e., after shutdown).
-func (s *Statistics) preInsertConn() bool {
+func (s *statistics) preInsertConn() bool {
 	// Check whether insertion of a new connection will exceed maxConns.
 	if len(s.virtual)+len(s.physical) == s.maxConns && s.maxConns > 0 {
 		// Extract the current statistics and send it to the serializer.
@@ -190,13 +190,13 @@ func (s *Statistics) preInsertConn() bool {
 	return s.shutdownCtx.Err() == nil
 }
 
-func (s *Statistics) extract() connCnts {
+func (s *statistics) extract() connCnts {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.extractLocked()
 }
 
-func (s *Statistics) extractLocked() connCnts {
+func (s *statistics) extractLocked() connCnts {
 	if len(s.virtual)+len(s.physical) == 0 {
 		return connCnts{}
 	}
@@ -208,7 +208,7 @@ func (s *Statistics) extractLocked() connCnts {
 
 // TestExtract synchronously extracts the current network statistics map
 // and resets the counters. This should only be used for testing purposes.
-func (s *Statistics) TestExtract() (virtual, physical map[netlogtype.Connection]netlogtype.Counts) {
+func (s *statistics) TestExtract() (virtual, physical map[netlogtype.Connection]netlogtype.Counts) {
 	cc := s.extract()
 	return cc.virtual, cc.physical
 }
@@ -216,7 +216,7 @@ func (s *Statistics) TestExtract() (virtual, physical map[netlogtype.Connection]
 // Shutdown performs a final flush of statistics.
 // Statistics for any subsequent calls to Update will be dropped.
 // It is safe to call Shutdown concurrently and repeatedly.
-func (s *Statistics) Shutdown(context.Context) error {
+func (s *statistics) Shutdown(context.Context) error {
 	s.shutdown()
 	return s.group.Wait()
 }

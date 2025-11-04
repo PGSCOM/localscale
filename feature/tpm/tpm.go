@@ -40,6 +40,8 @@ var infoOnce = sync.OnceValue(info)
 func init() {
 	feature.Register("tpm")
 	feature.HookTPMAvailable.Set(tpmSupported)
+	feature.HookHardwareAttestationAvailable.Set(tpmSupported)
+
 	hostinfo.RegisterHostinfoNewHook(func(hi *tailcfg.Hostinfo) {
 		hi.TPM = infoOnce()
 	})
@@ -53,11 +55,25 @@ func init() {
 }
 
 func tpmSupported() bool {
+	hi := infoOnce()
+	if hi == nil {
+		return false
+	}
+	if hi.FamilyIndicator != "2.0" {
+		return false
+	}
+
 	tpm, err := open()
 	if err != nil {
 		return false
 	}
-	tpm.Close()
+	defer tpm.Close()
+
+	if err := withSRK(logger.Discard, tpm, func(srk tpm2.AuthHandle) error {
+		return nil
+	}); err != nil {
+		return false
+	}
 	return true
 }
 
@@ -71,10 +87,16 @@ func info() *tailcfg.TPMInfo {
 
 	tpm, err := open()
 	if err != nil {
-		logf("error opening: %v", err)
+		if !os.IsNotExist(err) || verboseTPM() {
+			// Only log if it's an interesting error, not just "no TPM",
+			// as is very common, especially in VMs.
+			logf("error opening: %v", err)
+		}
 		return nil
 	}
-	logf("successfully opened")
+	if verboseTPM() {
+		logf("successfully opened")
+	}
 	defer tpm.Close()
 
 	info := new(tailcfg.TPMInfo)
@@ -96,6 +118,7 @@ func info() *tailcfg.TPMInfo {
 		{tpm2.TPMPTVendorTPMType, func(info *tailcfg.TPMInfo, value uint32) { info.Model = int(value) }},
 		{tpm2.TPMPTFirmwareVersion1, func(info *tailcfg.TPMInfo, value uint32) { info.FirmwareVersion += uint64(value) << 32 }},
 		{tpm2.TPMPTFirmwareVersion2, func(info *tailcfg.TPMInfo, value uint32) { info.FirmwareVersion += uint64(value) }},
+		{tpm2.TPMPTFamilyIndicator, toStr(&info.FamilyIndicator)},
 	} {
 		resp, err := tpm2.GetCapability{
 			Capability:    tpm2.TPMCapTPMProperties,

@@ -645,8 +645,8 @@ func (pm *profileManager) setProfileAsUserDefault(profile ipn.LoginProfileView) 
 	return pm.WriteState(k, []byte(profile.Key()))
 }
 
-func (pm *profileManager) loadSavedPrefs(key ipn.StateKey) (ipn.PrefsView, error) {
-	bs, err := pm.store.ReadState(key)
+func (pm *profileManager) loadSavedPrefs(k ipn.StateKey) (ipn.PrefsView, error) {
+	bs, err := pm.store.ReadState(k)
 	if err == ipn.ErrStateNotExist || len(bs) == 0 {
 		return defaultPrefs, nil
 	}
@@ -657,7 +657,7 @@ func (pm *profileManager) loadSavedPrefs(key ipn.StateKey) (ipn.PrefsView, error
 	if err := ipn.PrefsFromBytes(bs, savedPrefs); err != nil {
 		return ipn.PrefsView{}, fmt.Errorf("parsing saved prefs: %v", err)
 	}
-	pm.logf("using backend prefs for %q: %v", key, savedPrefs.Pretty())
+	pm.logf("using backend prefs for %q: %v", k, savedPrefs.Pretty())
 
 	// Ignore any old stored preferences for https://login.tailscale.com
 	// as the control server that would override the new default of

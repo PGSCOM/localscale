@@ -5,7 +5,7 @@
 // the node and the coordination server.
 package tailcfg
 
-//go:generate go run tailscale.com/cmd/viewer --type=User,Node,Hostinfo,NetInfo,Login,DNSConfig,RegisterResponse,RegisterResponseAuth,RegisterRequest,DERPHomeParams,DERPRegion,DERPMap,DERPNode,SSHRule,SSHAction,SSHPrincipal,ControlDialPlan,Location,UserProfile,VIPService --clonefunc
+//go:generate go run tailscale.com/cmd/viewer --type=User,Node,Hostinfo,NetInfo,Login,DNSConfig,RegisterResponse,RegisterResponseAuth,RegisterRequest,DERPHomeParams,DERPRegion,DERPMap,DERPNode,SSHRule,SSHAction,SSHPrincipal,ControlDialPlan,Location,UserProfile,VIPService,SSHPolicy --clonefunc
 
 import (
 	"bytes"
@@ -17,9 +17,11 @@ import (
 	"net/netip"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
+	"tailscale.com/feature/buildfeatures"
 	"tailscale.com/types/dnstype"
 	"tailscale.com/types/key"
 	"tailscale.com/types/opt"
@@ -173,7 +175,9 @@ type CapabilityVersion int
 //   - 126: 2025-09-17: Client uses seamless key renewal unless disabled by control (tailscale/corp#31479)
 //   - 127: 2025-09-19: can handle C2N /debug/netmap.
 //   - 128: 2025-10-02: can handle C2N /debug/health.
-const CurrentCapabilityVersion CapabilityVersion = 128
+//   - 129: 2025-10-04: Fixed sleep/wake deadlock in magicsock when using peer relay (PR #17449)
+//   - 130: 2025-10-06: client can send key.HardwareAttestationPublic and key.HardwareAttestationKeySignature in MapRequest
+const CurrentCapabilityVersion CapabilityVersion = 130
 
 // ID is an integer ID for a user, node, or login allocated by the
 // control plane.
@@ -924,6 +928,10 @@ type TPMInfo struct {
 	// https://trustedcomputinggroup.org/resource/tpm-library-specification/.
 	// Before revision 184, TCG used the "01.83" format for revision 183.
 	SpecRevision int `json:",omitempty"`
+
+	// FamilyIndicator is the TPM spec family, like "2.0".
+	// Read from TPM_PT_FAMILY_INDICATOR.
+	FamilyIndicator string `json:",omitempty"`
 }
 
 // Present reports whether a TPM device is present on this machine.
@@ -1088,6 +1096,9 @@ func (ni *NetInfo) String() string {
 }
 
 func (ni *NetInfo) portMapSummary() string {
+	if !buildfeatures.HasPortMapper {
+		return "x"
+	}
 	if !ni.HavePortMap && ni.UPnP == "" && ni.PMP == "" && ni.PCP == "" {
 		return "?"
 	}
@@ -1366,9 +1377,13 @@ type MapRequest struct {
 	// HardwareAttestationKey is the public key of the node's hardware-backed
 	// identity attestation key, if any.
 	HardwareAttestationKey key.HardwareAttestationPublic `json:",omitzero"`
-	// HardwareAttestationKeySignature is the signature of the NodeKey
-	// serialized using MarshalText using its hardware attestation key, if any.
+	// HardwareAttestationKeySignature is the signature of
+	// "$UNIX_TIMESTAMP|$NODE_KEY" using its hardware attestation key, if any.
 	HardwareAttestationKeySignature []byte `json:",omitempty"`
+	// HardwareAttestationKeySignatureTimestamp is the time at which the
+	// HardwareAttestationKeySignature was created, if any. This UNIX timestamp
+	// value is prepended to the node key when signing.
+	HardwareAttestationKeySignatureTimestamp time.Time `json:",omitzero"`
 
 	// Stream is whether the client wants to receive multiple MapResponses over
 	// the same HTTP connection.
@@ -1472,6 +1487,15 @@ func (pr PortRange) Contains(port uint16) bool {
 }
 
 var PortRangeAny = PortRange{0, 65535}
+
+func (pr PortRange) String() string {
+	if pr.First == pr.Last {
+		return strconv.FormatUint(uint64(pr.First), 10)
+	} else if pr == PortRangeAny {
+		return "*"
+	}
+	return fmt.Sprintf("%d-%d", pr.First, pr.Last)
+}
 
 // NetPortRange represents a range of ports that's allowed for one or more IPs.
 type NetPortRange struct {
@@ -2888,7 +2912,7 @@ type SSHAction struct {
 
 	// SessionDuration, if non-zero, is how long the session can stay open
 	// before being forcefully terminated.
-	SessionDuration time.Duration `json:"sessionDuration,omitempty"`
+	SessionDuration time.Duration `json:"sessionDuration,omitempty,format:nano"`
 
 	// AllowAgentForwarding, if true, allows accepted connections to forward
 	// the ssh agent if requested.

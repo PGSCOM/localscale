@@ -93,6 +93,7 @@ type FeatureMeta struct {
 // Features are the known Tailscale features that can be selectively included or
 // excluded via build tags, and a description of each.
 var Features = map[FeatureTag]FeatureMeta{
+	"ace":           {Sym: "ACE", Desc: "Alternate Connectivity Endpoints"},
 	"acme":          {Sym: "ACME", Desc: "ACME TLS certificate management"},
 	"appconnectors": {Sym: "AppConnectors", Desc: "App Connectors support"},
 	"aws":           {Sym: "AWS", Desc: "AWS integration"},
@@ -112,7 +113,11 @@ var Features = map[FeatureTag]FeatureMeta{
 		},
 	},
 	"bakedroots": {Sym: "BakedRoots", Desc: "Embed CA (LetsEncrypt) x509 roots to use as fallback"},
-	"bird":       {Sym: "Bird", Desc: "Bird BGP integration"},
+	"bird": {
+		Sym:  "Bird",
+		Desc: "Bird BGP integration",
+		Deps: []FeatureTag{"advertiseroutes"},
+	},
 	"c2n": {
 		Sym:                  "C2N",
 		Desc:                 "Control-to-node (C2N) support",
@@ -150,10 +155,17 @@ var Features = map[FeatureTag]FeatureMeta{
 		Desc: "Generic Receive Offload support (performance)",
 		Deps: []FeatureTag{"netstack"},
 	},
-	"hujsonconf":    {Sym: "HuJSONConf", Desc: "HuJSON config file support"},
-	"iptables":      {Sym: "IPTables", Desc: "Linux iptables support"},
-	"kube":          {Sym: "Kube", Desc: "Kubernetes integration"},
-	"linuxdnsfight": {Sym: "LinuxDNSFight", Desc: "Linux support for detecting DNS fights (inotify watching of /etc/resolv.conf)"},
+	"health":             {Sym: "Health", Desc: "Health checking support"},
+	"hujsonconf":         {Sym: "HuJSONConf", Desc: "HuJSON config file support"},
+	"identityfederation": {Sym: "IdentityFederation", Desc: "Auth key generation via identity federation support"},
+	"iptables":           {Sym: "IPTables", Desc: "Linux iptables support"},
+	"kube":               {Sym: "Kube", Desc: "Kubernetes integration"},
+	"lazywg":             {Sym: "LazyWG", Desc: "Lazy WireGuard configuration for memory-constrained devices with large netmaps"},
+	"linuxdnsfight":      {Sym: "LinuxDNSFight", Desc: "Linux support for detecting DNS fights (inotify watching of /etc/resolv.conf)"},
+	"linkspeed": {
+		Sym:  "LinkSpeed",
+		Desc: "Set link speed on TUN device for better OS integration (Linux only)",
+	},
 	"listenrawdisco": {
 		Sym:  "ListenRawDisco",
 		Desc: "Use raw sockets for more robust disco (NAT traversal) message receiving (Linux only)",
@@ -262,6 +274,10 @@ var Features = map[FeatureTag]FeatureMeta{
 	"useproxy": {
 		Sym:  "UseProxy",
 		Desc: "Support using system proxies as specified by env vars or the system configuration to reach Tailscale servers.",
+	},
+	"usermetrics": {
+		Sym:  "UserMetrics",
+		Desc: "Usermetrics (documented, stable) metrics support",
 	},
 	"wakeonlan": {Sym: "WakeOnLAN", Desc: "Wake-on-LAN support"},
 	"webclient": {

@@ -137,14 +137,14 @@ func TestOmitCaptivePortal(t *testing.T) {
 	}.Check(t)
 }
 
-func TestOmitOAuthKey(t *testing.T) {
+func TestOmitAuth(t *testing.T) {
 	deptest.DepChecker{
 		GOOS:   "linux",
 		GOARCH: "amd64",
-		Tags:   "ts_omit_oauthkey,ts_include_cli",
+		Tags:   "ts_omit_oauthkey,ts_omit_identityfederation,ts_include_cli",
 		OnDep: func(dep string) {
 			if strings.HasPrefix(dep, "golang.org/x/oauth2") {
-				t.Errorf("unexpected dep with ts_omit_oauthkey: %q", dep)
+				t.Errorf("unexpected oauth2 dep: %q", dep)
 			}
 		},
 	}.Check(t)
@@ -243,6 +243,9 @@ func TestMinTailscaledNoCLI(t *testing.T) {
 		"golang.org/x/net/proxy",
 		"internal/socks",
 		"github.com/tailscale/peercred",
+		"tailscale.com/types/netlogtype",
+		"deephash",
+		"util/hashx",
 	}
 	deptest.DepChecker{
 		GOOS:   "linux",
@@ -264,6 +267,11 @@ func TestMinTailscaledWithCLI(t *testing.T) {
 		"hujson",
 		"pprof",
 		"multierr", // https://github.com/tailscale/tailscale/pull/17379
+		"tailscale.com/metrics",
+		"tailscale.com/tsweb/varz",
+		"dirwalk",
+		"deephash",
+		"util/hashx",
 	}
 	deptest.DepChecker{
 		GOOS:   "linux",
@@ -277,7 +285,9 @@ func TestMinTailscaledWithCLI(t *testing.T) {
 			}
 		},
 		BadDeps: map[string]string{
-			"golang.org/x/net/http2": "unexpected x/net/http2 dep; tailscale/tailscale#17305",
+			"golang.org/x/net/http2":        "unexpected x/net/http2 dep; tailscale/tailscale#17305",
+			"expvar":                        "unexpected expvar dep",
+			"github.com/mdlayher/genetlink": "unexpected genetlink dep",
 		},
 	}.Check(t)
 }
