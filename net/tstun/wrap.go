@@ -24,8 +24,6 @@ import (
 	"go4.org/mem"
 	"tailscale.com/disco"
 	"tailscale.com/feature/buildfeatures"
-	tsmetrics "tailscale.com/metrics"
-	"tailscale.com/net/connstats"
 	"tailscale.com/net/packet"
 	"tailscale.com/net/packet/checksum"
 	"tailscale.com/net/tsaddr"
@@ -34,7 +32,9 @@ import (
 	"tailscale.com/types/ipproto"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
+	"tailscale.com/types/netlogfunc"
 	"tailscale.com/util/clientmetric"
+	"tailscale.com/util/eventbus"
 	"tailscale.com/util/usermetric"
 	"tailscale.com/wgengine/filter"
 	"tailscale.com/wgengine/netstack/gro"
@@ -204,17 +204,20 @@ type Wrapper struct {
 	// disableTSMPRejected disables TSMP rejected responses. For tests.
 	disableTSMPRejected bool
 
-	// stats maintains per-connection counters.
-	stats atomic.Pointer[connstats.Statistics]
+	// connCounter maintains per-connection counters.
+	connCounter syncs.AtomicValue[netlogfunc.ConnectionCounter]
 
 	captureHook syncs.AtomicValue[packet.CaptureCallback]
 
 	metrics *metrics
+
+	eventClient              *eventbus.Client
+	discoKeyAdvertisementPub *eventbus.Publisher[DiscoKeyAdvertisement]
 }
 
 type metrics struct {
-	inboundDroppedPacketsTotal  *tsmetrics.MultiLabelMap[usermetric.DropLabels]
-	outboundDroppedPacketsTotal *tsmetrics.MultiLabelMap[usermetric.DropLabels]
+	inboundDroppedPacketsTotal  *usermetric.MultiLabelMap[usermetric.DropLabels]
+	outboundDroppedPacketsTotal *usermetric.MultiLabelMap[usermetric.DropLabels]
 }
 
 func registerMetrics(reg *usermetric.Registry) *metrics {
@@ -255,15 +258,15 @@ func (w *Wrapper) Start() {
 	close(w.startCh)
 }
 
-func WrapTAP(logf logger.Logf, tdev tun.Device, m *usermetric.Registry) *Wrapper {
-	return wrap(logf, tdev, true, m)
+func WrapTAP(logf logger.Logf, tdev tun.Device, m *usermetric.Registry, bus *eventbus.Bus) *Wrapper {
+	return wrap(logf, tdev, true, m, bus)
 }
 
-func Wrap(logf logger.Logf, tdev tun.Device, m *usermetric.Registry) *Wrapper {
-	return wrap(logf, tdev, false, m)
+func Wrap(logf logger.Logf, tdev tun.Device, m *usermetric.Registry, bus *eventbus.Bus) *Wrapper {
+	return wrap(logf, tdev, false, m, bus)
 }
 
-func wrap(logf logger.Logf, tdev tun.Device, isTAP bool, m *usermetric.Registry) *Wrapper {
+func wrap(logf logger.Logf, tdev tun.Device, isTAP bool, m *usermetric.Registry, bus *eventbus.Bus) *Wrapper {
 	logf = logger.WithPrefix(logf, "tstun: ")
 	w := &Wrapper{
 		logf:        logf,
@@ -283,6 +286,9 @@ func wrap(logf logger.Logf, tdev tun.Device, isTAP bool, m *usermetric.Registry)
 		startCh:     make(chan struct{}),
 		metrics:     registerMetrics(m),
 	}
+
+	w.eventClient = bus.Client("net.tstun")
+	w.discoKeyAdvertisementPub = eventbus.Publish[DiscoKeyAdvertisement](w.eventClient)
 
 	w.vectorBuffer = make([][]byte, tdev.BatchSize())
 	for i := range w.vectorBuffer {
@@ -312,7 +318,9 @@ func (t *Wrapper) now() time.Time {
 //
 // The map ownership passes to the Wrapper. It must be non-nil.
 func (t *Wrapper) SetDestIPActivityFuncs(m map[netip.Addr]func()) {
-	t.destIPActivity.Store(m)
+	if buildfeatures.HasLazyWG {
+		t.destIPActivity.Store(m)
+	}
 }
 
 // SetDiscoKey sets the current discovery key.
@@ -356,6 +364,7 @@ func (t *Wrapper) Close() error {
 		close(t.vectorOutbound)
 		t.outboundMu.Unlock()
 		err = t.tdev.Close()
+		t.eventClient.Close()
 	})
 	return err
 }
@@ -948,12 +957,14 @@ func (t *Wrapper) Read(buffs [][]byte, sizes []int, offset int) (int, error) {
 	for _, data := range res.data {
 		p.Decode(data[res.dataOffset:])
 
-		if m := t.destIPActivity.Load(); m != nil {
-			if fn := m[p.Dst.Addr()]; fn != nil {
-				fn()
+		if buildfeatures.HasLazyWG {
+			if m := t.destIPActivity.Load(); m != nil {
+				if fn := m[p.Dst.Addr()]; fn != nil {
+					fn()
+				}
 			}
 		}
-		if captHook != nil {
+		if buildfeatures.HasCapture && captHook != nil {
 			captHook(packet.FromLocal, t.now(), p.Buffer(), p.CaptureMeta)
 		}
 		if !t.disableFilter {
@@ -962,6 +973,11 @@ func (t *Wrapper) Read(buffs [][]byte, sizes []int, offset int) (int, error) {
 			if response != filter.Accept {
 				metricPacketOutDrop.Add(1)
 				continue
+			}
+		}
+		if buildfeatures.HasNetLog {
+			if update := t.connCounter.Load(); update != nil {
+				updateConnCounter(update, p.Buffer(), false)
 			}
 		}
 
@@ -973,9 +989,6 @@ func (t *Wrapper) Read(buffs [][]byte, sizes []int, offset int) (int, error) {
 			panic(fmt.Sprintf("short copy: %d != %d", n, len(data)-res.dataOffset))
 		}
 		sizes[buffsPos] = n
-		if stats := t.stats.Load(); stats != nil {
-			stats.UpdateTxVirtual(p.Buffer())
-		}
 		buffsPos++
 	}
 	if buffsGRO != nil {
@@ -1083,9 +1096,11 @@ func (t *Wrapper) injectedRead(res tunInjectedRead, outBuffs [][]byte, sizes []i
 	pc.snat(p)
 	invertGSOChecksum(pkt, gso)
 
-	if m := t.destIPActivity.Load(); m != nil {
-		if fn := m[p.Dst.Addr()]; fn != nil {
-			fn()
+	if buildfeatures.HasLazyWG {
+		if m := t.destIPActivity.Load(); m != nil {
+			if fn := m[p.Dst.Addr()]; fn != nil {
+				fn()
+			}
 		}
 	}
 
@@ -1098,15 +1113,22 @@ func (t *Wrapper) injectedRead(res tunInjectedRead, outBuffs [][]byte, sizes []i
 		n, err = tun.GSOSplit(pkt, gsoOptions, outBuffs, sizes, offset)
 	}
 
-	if stats := t.stats.Load(); stats != nil {
-		for i := 0; i < n; i++ {
-			stats.UpdateTxVirtual(outBuffs[i][offset : offset+sizes[i]])
+	if buildfeatures.HasNetLog {
+		if update := t.connCounter.Load(); update != nil {
+			for i := 0; i < n; i++ {
+				updateConnCounter(update, outBuffs[i][offset:offset+sizes[i]], false)
+			}
 		}
 	}
 
 	t.noteActivity()
 	metricPacketOut.Add(int64(n))
 	return n, err
+}
+
+type DiscoKeyAdvertisement struct {
+	Src netip.Addr
+	Key key.DiscoPublic
 }
 
 func (t *Wrapper) filterPacketInboundFromWireGuard(p *packet.Parsed, captHook packet.CaptureCallback, pc *peerConfigTable, gro *gro.GRO) (filter.Response, *gro.GRO) {
@@ -1118,6 +1140,12 @@ func (t *Wrapper) filterPacketInboundFromWireGuard(p *packet.Parsed, captHook pa
 		if pingReq, ok := p.AsTSMPPing(); ok {
 			t.noteActivity()
 			t.injectOutboundPong(p, pingReq)
+			return filter.DropSilently, gro
+		} else if discoKeyAdvert, ok := p.AsTSMPDiscoAdvertisement(); ok {
+			t.discoKeyAdvertisementPub.Publish(DiscoKeyAdvertisement{
+				Src: discoKeyAdvert.Src,
+				Key: discoKeyAdvert.Key,
+			})
 			return filter.DropSilently, gro
 		} else if data, ok := p.AsTSMPPong(); ok {
 			if f := t.OnTSMPPongReceived; f != nil {
@@ -1266,9 +1294,11 @@ func (t *Wrapper) Write(buffs [][]byte, offset int) (int, error) {
 }
 
 func (t *Wrapper) tdevWrite(buffs [][]byte, offset int) (int, error) {
-	if stats := t.stats.Load(); stats != nil {
-		for i := range buffs {
-			stats.UpdateRxVirtual((buffs)[i][offset:])
+	if buildfeatures.HasNetLog {
+		if update := t.connCounter.Load(); update != nil {
+			for i := range buffs {
+				updateConnCounter(update, buffs[i][offset:], true)
+			}
 		}
 	}
 	return t.tdev.Write(buffs, offset)
@@ -1487,10 +1517,12 @@ func (t *Wrapper) Unwrap() tun.Device {
 	return t.tdev
 }
 
-// SetStatistics specifies a per-connection statistics aggregator.
+// SetConnectionCounter specifies a per-connection statistics aggregator.
 // Nil may be specified to disable statistics gathering.
-func (t *Wrapper) SetStatistics(stats *connstats.Statistics) {
-	t.stats.Store(stats)
+func (t *Wrapper) SetConnectionCounter(fn netlogfunc.ConnectionCounter) {
+	if buildfeatures.HasNetLog {
+		t.connCounter.Store(fn)
+	}
 }
 
 var (
@@ -1510,4 +1542,14 @@ func (t *Wrapper) InstallCaptureHook(cb packet.CaptureCallback) {
 		return
 	}
 	t.captureHook.Store(cb)
+}
+
+func updateConnCounter(update netlogfunc.ConnectionCounter, b []byte, receive bool) {
+	var p packet.Parsed
+	p.Decode(b)
+	if receive {
+		update(p.IPProto, p.Dst, p.Src, 1, len(b), true)
+	} else {
+		update(p.IPProto, p.Src, p.Dst, 1, len(b), false)
+	}
 }

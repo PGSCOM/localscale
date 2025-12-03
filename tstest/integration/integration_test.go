@@ -22,8 +22,10 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -36,6 +38,7 @@ import (
 	"tailscale.com/cmd/testwrapper/flakytest"
 	"tailscale.com/feature"
 	_ "tailscale.com/feature/clientupdate"
+	"tailscale.com/health"
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
 	"tailscale.com/net/tsaddr"
@@ -175,6 +178,28 @@ func TestControlKnobs(t *testing.T) {
 	}
 }
 
+func TestExpectedFeaturesLinked(t *testing.T) {
+	tstest.Shard(t)
+	tstest.Parallel(t)
+	env := NewTestEnv(t)
+	n1 := NewTestNode(t, env)
+
+	d1 := n1.StartDaemon()
+	n1.AwaitResponding()
+	lc := n1.LocalClient()
+	got, err := lc.QueryOptionalFeatures(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Features["portmapper"] {
+		t.Errorf("optional feature portmapper unexpectedly not found: got %v", got.Features)
+	}
+
+	d1.MustCleanShutdown(t)
+
+	t.Logf("number of HTTP logcatcher requests: %v", env.LogCatcher.numRequests())
+}
+
 func TestCollectPanic(t *testing.T) {
 	flakytest.Mark(t, "https://github.com/tailscale/tailscale/issues/15865")
 	tstest.Shard(t)
@@ -268,7 +293,66 @@ func TestStateSavedOnStart(t *testing.T) {
 	d1.MustCleanShutdown(t)
 }
 
+// This handler receives auth URLs, and logs into control.
+//
+// It counts how many URLs it sees, and will fail the test if it
+// sees multiple login URLs.
+func completeLogin(t *testing.T, control *testcontrol.Server, counter *atomic.Int32) func(string) error {
+	return func(urlStr string) error {
+		t.Logf("saw auth URL %q", urlStr)
+		if control.CompleteAuth(urlStr) {
+			if counter.Add(1) > 1 {
+				err := errors.New("completed multiple auth URLs")
+				t.Error(err)
+				return err
+			}
+			t.Logf("completed login to %s", urlStr)
+			return nil
+		} else {
+			err := fmt.Errorf("failed to complete initial login to %q", urlStr)
+			t.Fatal(err)
+			return err
+		}
+	}
+}
+
+// This handler receives device approval URLs, and approves the device.
+//
+// It counts how many URLs it sees, and will fail the test if it
+// sees multiple device approval URLs, or if you try to approve a device
+// with the wrong control server.
+func completeDeviceApproval(t *testing.T, node *TestNode, counter *atomic.Int32) func(string) error {
+	return func(urlStr string) error {
+		control := node.env.Control
+		nodeKey := node.MustStatus().Self.PublicKey
+		t.Logf("saw device approval URL %q", urlStr)
+		if control.CompleteDeviceApproval(node.env.ControlURL(), urlStr, &nodeKey) {
+			if counter.Add(1) > 1 {
+				err := errors.New("completed multiple device approval URLs")
+				t.Error(err)
+				return err
+			}
+			t.Log("completed device approval")
+			return nil
+		} else {
+			err := errors.New("failed to complete device approval")
+			t.Fatal(err)
+			return err
+		}
+	}
+}
+
 func TestOneNodeUpAuth(t *testing.T) {
+	type step struct {
+		args []string
+		//
+		// Do we expect to log in again with a new /auth/ URL?
+		wantAuthURL bool
+		//
+		// Do we expect to need a device approval URL?
+		wantDeviceApprovalURL bool
+	}
+
 	for _, tt := range []struct {
 		name string
 		args []string
@@ -276,65 +360,112 @@ func TestOneNodeUpAuth(t *testing.T) {
 		// What auth key should we use for control?
 		authKey string
 		//
-		// Is tailscaled already logged in before we run this `up` command?
-		alreadyLoggedIn bool
+		// Do we require device approval in the tailnet?
+		requireDeviceApproval bool
 		//
-		// Do we need to log in again with a new /auth/ URL?
-		needsNewAuthURL bool
+		// What CLI commands should we run in this test?
+		steps []step
 	}{
 		{
-			name:            "up",
-			args:            []string{"up"},
-			needsNewAuthURL: true,
+			name: "up",
+			steps: []step{
+				{args: []string{"up"}, wantAuthURL: true},
+			},
 		},
 		{
-			name:            "up-with-force-reauth",
-			args:            []string{"up", "--force-reauth"},
-			needsNewAuthURL: true,
+			name: "up-with-machine-auth",
+			steps: []step{
+				{args: []string{"up"}, wantAuthURL: true, wantDeviceApprovalURL: true},
+			},
+			requireDeviceApproval: true,
 		},
 		{
-			name:            "up-with-auth-key",
-			args:            []string{"up", "--auth-key=opensesame"},
-			authKey:         "opensesame",
-			needsNewAuthURL: false,
+			name: "up-with-force-reauth",
+			steps: []step{
+				{args: []string{"up", "--force-reauth"}, wantAuthURL: true},
+			},
 		},
 		{
-			name:            "up-with-force-reauth-and-auth-key",
-			args:            []string{"up", "--force-reauth", "--auth-key=opensesame"},
-			authKey:         "opensesame",
-			needsNewAuthURL: false,
+			name:    "up-with-auth-key",
+			authKey: "opensesame",
+			steps: []step{
+				{args: []string{"up", "--auth-key=opensesame"}},
+			},
 		},
 		{
-			name:            "up-after-login",
-			args:            []string{"up"},
-			alreadyLoggedIn: true,
-			needsNewAuthURL: false,
+			name:    "up-with-auth-key-with-machine-auth",
+			authKey: "opensesame",
+			steps: []step{
+				{
+					args:                  []string{"up", "--auth-key=opensesame"},
+					wantAuthURL:           false,
+					wantDeviceApprovalURL: true,
+				},
+			},
+			requireDeviceApproval: true,
 		},
 		{
-			name:            "up-with-force-reauth-after-login",
-			args:            []string{"up", "--force-reauth"},
-			alreadyLoggedIn: true,
-			needsNewAuthURL: true,
+			name:    "up-with-force-reauth-and-auth-key",
+			authKey: "opensesame",
+			steps: []step{
+				{args: []string{"up", "--force-reauth", "--auth-key=opensesame"}},
+			},
 		},
 		{
-			name:            "up-with-auth-key-after-login",
-			args:            []string{"up", "--auth-key=opensesame"},
-			authKey:         "opensesame",
-			alreadyLoggedIn: true,
-			needsNewAuthURL: false,
+			name: "up-after-login",
+			steps: []step{
+				{args: []string{"up"}, wantAuthURL: true},
+				{args: []string{"up"}, wantAuthURL: false},
+			},
 		},
 		{
-			name:            "up-with-force-reauth-and-auth-key-after-login",
-			args:            []string{"up", "--force-reauth", "--auth-key=opensesame"},
-			authKey:         "opensesame",
-			alreadyLoggedIn: true,
-			needsNewAuthURL: false,
+			name: "up-after-login-with-machine-approval",
+			steps: []step{
+				{args: []string{"up"}, wantAuthURL: true, wantDeviceApprovalURL: true},
+				{args: []string{"up"}, wantAuthURL: false, wantDeviceApprovalURL: false},
+			},
+			requireDeviceApproval: true,
+		},
+		{
+			name: "up-with-force-reauth-after-login",
+			steps: []step{
+				{args: []string{"up"}, wantAuthURL: true},
+				{args: []string{"up", "--force-reauth"}, wantAuthURL: true},
+			},
+		},
+		{
+			name: "up-with-force-reauth-after-login-with-machine-approval",
+			steps: []step{
+				{args: []string{"up"}, wantAuthURL: true, wantDeviceApprovalURL: true},
+				{args: []string{"up", "--force-reauth"}, wantAuthURL: true, wantDeviceApprovalURL: false},
+			},
+			requireDeviceApproval: true,
+		},
+		{
+			name:    "up-with-auth-key-after-login",
+			authKey: "opensesame",
+			steps: []step{
+				{args: []string{"up", "--auth-key=opensesame"}},
+				{args: []string{"up", "--auth-key=opensesame"}},
+			},
+		},
+		{
+			name:    "up-with-force-reauth-and-auth-key-after-login",
+			authKey: "opensesame",
+			steps: []step{
+				{args: []string{"up", "--auth-key=opensesame"}},
+				{args: []string{"up", "--force-reauth", "--auth-key=opensesame"}},
+			},
 		},
 	} {
 		tstest.Shard(t)
 
 		for _, useSeamlessKeyRenewal := range []bool{true, false} {
-			t.Run(fmt.Sprintf("%s-seamless-%t", tt.name, useSeamlessKeyRenewal), func(t *testing.T) {
+			name := tt.name
+			if useSeamlessKeyRenewal {
+				name += "-with-seamless"
+			}
+			t.Run(name, func(t *testing.T) {
 				tstest.Parallel(t)
 
 				env := NewTestEnv(t, ConfigureControl(
@@ -343,6 +474,10 @@ func TestOneNodeUpAuth(t *testing.T) {
 							control.RequireAuthKey = tt.authKey
 						} else {
 							control.RequireAuth = true
+						}
+
+						if tt.requireDeviceApproval {
+							control.RequireMachineAuth = true
 						}
 
 						control.AllNodesSameUser = true
@@ -359,73 +494,225 @@ func TestOneNodeUpAuth(t *testing.T) {
 				d1 := n1.StartDaemon()
 				defer d1.MustCleanShutdown(t)
 
-				cmdArgs := append(tt.args, "--login-server="+env.ControlURL())
+				for i, step := range tt.steps {
+					t.Logf("Running step %d", i)
+					cmdArgs := append(step.args, "--login-server="+env.ControlURL())
 
-				// This handler looks for /auth/ URLs in the stdout from "tailscale up",
-				// and if it sees them, completes the auth process.
-				//
-				// It counts how many auth URLs it's seen.
-				var authCountAtomic atomic.Int32
-				authURLHandler := &authURLParserWriter{fn: func(urlStr string) error {
-					t.Logf("saw auth URL %q", urlStr)
-					if env.Control.CompleteAuth(urlStr) {
-						if authCountAtomic.Add(1) > 1 {
-							err := errors.New("completed multiple auth URLs")
-							t.Error(err)
-							return err
-						}
-						t.Logf("completed login to %s", urlStr)
-						return nil
-					} else {
-						err := fmt.Errorf("Failed to complete initial login to %q", urlStr)
-						t.Fatal(err)
-						return err
+					t.Logf("Running command: %s", strings.Join(cmdArgs, " "))
+
+					var authURLCount atomic.Int32
+					var deviceApprovalURLCount atomic.Int32
+
+					handler := &authURLParserWriter{t: t,
+						authURLFn:           completeLogin(t, env.Control, &authURLCount),
+						deviceApprovalURLFn: completeDeviceApproval(t, n1, &deviceApprovalURLCount),
 					}
-				}}
 
-				// If we should be logged in at the start of the test case, go ahead
-				// and run the login command.
-				//
-				// Otherwise, just wait for tailscaled to be listening.
-				if tt.alreadyLoggedIn {
-					t.Logf("Running initial login: %s", strings.Join(cmdArgs, " "))
 					cmd := n1.Tailscale(cmdArgs...)
-					cmd.Stdout = authURLHandler
+					cmd.Stdout = handler
+					cmd.Stdout = handler
 					cmd.Stderr = cmd.Stdout
 					if err := cmd.Run(); err != nil {
 						t.Fatalf("up: %v", err)
 					}
-					authCountAtomic.Store(0)
+
 					n1.AwaitRunning()
-				} else {
-					n1.AwaitListening()
-				}
 
-				st := n1.MustStatus()
-				t.Logf("Status: %s", st.BackendState)
+					var wantAuthURLCount int32
+					if step.wantAuthURL {
+						wantAuthURLCount = 1
+					}
+					if n := authURLCount.Load(); n != wantAuthURLCount {
+						t.Errorf("Auth URLs completed = %d; want %d", n, wantAuthURLCount)
+					}
 
-				t.Logf("Running command: %s", strings.Join(cmdArgs, " "))
-				cmd := n1.Tailscale(cmdArgs...)
-				cmd.Stdout = authURLHandler
-				cmd.Stderr = cmd.Stdout
-
-				if err := cmd.Run(); err != nil {
-					t.Fatalf("up: %v", err)
-				}
-				t.Logf("Got IP: %v", n1.AwaitIP4())
-
-				n1.AwaitRunning()
-
-				var expectedAuthUrls int32
-				if tt.needsNewAuthURL {
-					expectedAuthUrls = 1
-				}
-				if n := authCountAtomic.Load(); n != expectedAuthUrls {
-					t.Errorf("Auth URLs completed = %d; want %d", n, expectedAuthUrls)
+					var wantDeviceApprovalURLCount int32
+					if step.wantDeviceApprovalURL {
+						wantDeviceApprovalURLCount = 1
+					}
+					if n := deviceApprovalURLCount.Load(); n != wantDeviceApprovalURLCount {
+						t.Errorf("Device approval URLs completed = %d; want %d", n, wantDeviceApprovalURLCount)
+					}
 				}
 			})
 		}
 	}
+}
+
+// Returns true if the error returned by [exec.Run] fails with a non-zero
+// exit code, false otherwise.
+func isNonZeroExitCode(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	exitError, ok := err.(*exec.ExitError)
+	if !ok {
+		return false
+	}
+
+	return exitError.ExitCode() != 0
+}
+
+// If we interrupt `tailscale up` and then run it again, we should only
+// print a single auth URL.
+func TestOneNodeUpInterruptedAuth(t *testing.T) {
+	tstest.Shard(t)
+	tstest.Parallel(t)
+
+	env := NewTestEnv(t, ConfigureControl(
+		func(control *testcontrol.Server) {
+			control.RequireAuth = true
+			control.AllNodesSameUser = true
+		},
+	))
+
+	n := NewTestNode(t, env)
+	d := n.StartDaemon()
+	defer d.MustCleanShutdown(t)
+
+	cmdArgs := []string{"up", "--login-server=" + env.ControlURL()}
+
+	// The first time we run the command, we wait for an auth URL to be
+	// printed, and then we cancel the command -- equivalent to ^C.
+	//
+	// At this point, we've connected to control to get an auth URL,
+	// and printed it in the CLI, but not clicked it.
+	t.Logf("Running command for the first time: %s", strings.Join(cmdArgs, " "))
+	cmd1 := n.Tailscale(cmdArgs...)
+
+	// This handler watches for auth URLs in stdout, then cancels the
+	// running `tailscale up` CLI command.
+	cmd1.Stdout = &authURLParserWriter{t: t, authURLFn: func(urlStr string) error {
+		t.Logf("saw auth URL %q", urlStr)
+		cmd1.Process.Kill()
+		return nil
+	}}
+	cmd1.Stderr = cmd1.Stdout
+
+	if err := cmd1.Run(); !isNonZeroExitCode(err) {
+		t.Fatalf("Command did not fail with non-zero exit code: %q", err)
+	}
+
+	// Because we didn't click the auth URL, we should still be in NeedsLogin.
+	n.AwaitBackendState("NeedsLogin")
+
+	// The second time we run the command, we click the first auth URL we see
+	// and check that we log in correctly.
+	//
+	// In #17361, there was a bug where we'd print two auth URLs, and you could
+	// click either auth URL and log in to control, but logging in through the
+	// first URL would leave `tailscale up` hanging.
+	//
+	// Using `authURLHandler` ensures we only print the new, correct auth URL.
+	//
+	// If we print both URLs, it will throw an error because it only expects
+	// to log in with one auth URL.
+	//
+	// If we only print the stale auth URL, the test will timeout because
+	// `tailscale up` will never return.
+	t.Logf("Running command for the second time: %s", strings.Join(cmdArgs, " "))
+
+	var authURLCount atomic.Int32
+
+	cmd2 := n.Tailscale(cmdArgs...)
+	cmd2.Stdout = &authURLParserWriter{
+		t: t, authURLFn: completeLogin(t, env.Control, &authURLCount),
+	}
+	cmd2.Stderr = cmd2.Stdout
+
+	if err := cmd2.Run(); err != nil {
+		t.Fatalf("up: %v", err)
+	}
+
+	if urls := authURLCount.Load(); urls != 1 {
+		t.Errorf("Auth URLs completed = %d; want %d", urls, 1)
+	}
+
+	n.AwaitRunning()
+}
+
+// If we interrupt `tailscale up` and login successfully, but don't
+// complete the device approval, we should see the device approval URL
+// when we run `tailscale up` a second time.
+func TestOneNodeUpInterruptedDeviceApproval(t *testing.T) {
+	tstest.Shard(t)
+	tstest.Parallel(t)
+
+	env := NewTestEnv(t, ConfigureControl(
+		func(control *testcontrol.Server) {
+			control.RequireAuth = true
+			control.RequireMachineAuth = true
+			control.AllNodesSameUser = true
+		},
+	))
+
+	n := NewTestNode(t, env)
+	d := n.StartDaemon()
+	defer d.MustCleanShutdown(t)
+
+	// The first time we run the command, we:
+	//
+	//    * set a custom login URL
+	//    * wait for an auth URL to be printed
+	//    * click it to complete the login process
+	//    * wait for a device approval URL to be printed
+	//    * cancel the command, equivalent to ^C
+	//
+	// At this point, we've logged in to control, but our node isn't
+	// approved to connect to the tailnet.
+	cmd1Args := []string{"up", "--login-server=" + env.ControlURL()}
+	t.Logf("Running command: %s", strings.Join(cmd1Args, " "))
+	cmd1 := n.Tailscale(cmd1Args...)
+
+	handler1 := &authURLParserWriter{t: t,
+		authURLFn: completeLogin(t, env.Control, &atomic.Int32{}),
+		deviceApprovalURLFn: func(urlStr string) error {
+			t.Logf("saw device approval URL %q", urlStr)
+			cmd1.Process.Kill()
+			return nil
+		},
+	}
+	cmd1.Stdout = handler1
+	cmd1.Stderr = cmd1.Stdout
+
+	if err := cmd1.Run(); !isNonZeroExitCode(err) {
+		t.Fatalf("Command did not fail with non-zero exit code: %q", err)
+	}
+
+	// Because we logged in but we didn't complete the device approval, we
+	// should be in state NeedsMachineAuth.
+	n.AwaitBackendState("NeedsMachineAuth")
+
+	// The second time we run the command, we expect not to get an auth URL
+	// and go straight to the device approval URL. We don't need to pass the
+	// login server, because `tailscale up` should remember our control URL.
+	cmd2Args := []string{"up"}
+	t.Logf("Running command: %s", strings.Join(cmd2Args, " "))
+
+	var deviceApprovalURLCount atomic.Int32
+
+	cmd2 := n.Tailscale(cmd2Args...)
+	cmd2.Stdout = &authURLParserWriter{t: t,
+		authURLFn: func(urlStr string) error {
+			t.Fatalf("got unexpected auth URL: %q", urlStr)
+			cmd2.Process.Kill()
+			return nil
+		},
+		deviceApprovalURLFn: completeDeviceApproval(t, n, &deviceApprovalURLCount),
+	}
+	cmd2.Stderr = cmd2.Stdout
+
+	if err := cmd2.Run(); err != nil {
+		t.Fatalf("up: %v", err)
+	}
+
+	wantDeviceApprovalURLCount := int32(1)
+	if n := deviceApprovalURLCount.Load(); n != wantDeviceApprovalURLCount {
+		t.Errorf("Device approval URLs completed = %d; want %d", n, wantDeviceApprovalURLCount)
+	}
+
+	n.AwaitRunning()
 }
 
 func TestConfigFileAuthKey(t *testing.T) {
@@ -828,6 +1115,7 @@ func TestOneNodeUpWindowsStyle(t *testing.T) {
 // jailed node cannot initiate connections to the other node however the other
 // node can initiate connections to the jailed node.
 func TestClientSideJailing(t *testing.T) {
+	flakytest.Mark(t, "https://github.com/tailscale/tailscale/issues/17419")
 	tstest.Shard(t)
 	tstest.Parallel(t)
 	env := NewTestEnv(t)
@@ -1125,13 +1413,26 @@ func TestLogoutRemovesAllPeers(t *testing.T) {
 	wantNode0PeerCount(expectedPeers) // all existing peers and the new node
 }
 
-func TestAutoUpdateDefaults(t *testing.T) {
-	if !feature.CanAutoUpdate() {
-		t.Skip("auto-updates not supported on this platform")
-	}
+func TestAutoUpdateDefaults(t *testing.T)     { testAutoUpdateDefaults(t, false) }
+func TestAutoUpdateDefaults_cap(t *testing.T) { testAutoUpdateDefaults(t, true) }
+
+// useCap is whether to use NodeAttrDefaultAutoUpdate (as opposed to the old
+// DeprecatedDefaultAutoUpdate top-level MapResponse field).
+func testAutoUpdateDefaults(t *testing.T, useCap bool) {
+	t.Cleanup(feature.HookCanAutoUpdate.SetForTest(func() bool { return true }))
+
 	tstest.Shard(t)
-	tstest.Parallel(t)
 	env := NewTestEnv(t)
+
+	var (
+		modifyMu               sync.Mutex
+		modifyFirstMapResponse = func(*tailcfg.MapResponse, *tailcfg.MapRequest) {}
+	)
+	env.Control.ModifyFirstMapResponse = func(mr *tailcfg.MapResponse, req *tailcfg.MapRequest) {
+		modifyMu.Lock()
+		defer modifyMu.Unlock()
+		modifyFirstMapResponse(mr, req)
+	}
 
 	checkDefault := func(n *TestNode, want bool) error {
 		enabled, ok := n.diskPrefs().AutoUpdate.Apply.Get()
@@ -1144,17 +1445,23 @@ func TestAutoUpdateDefaults(t *testing.T) {
 		return nil
 	}
 
-	sendAndCheckDefault := func(t *testing.T, n *TestNode, send, want bool) {
-		t.Helper()
-		if !env.Control.AddRawMapResponse(n.MustStatus().Self.PublicKey, &tailcfg.MapResponse{
-			DefaultAutoUpdate: opt.NewBool(send),
-		}) {
-			t.Fatal("failed to send MapResponse to node")
-		}
-		if err := tstest.WaitFor(2*time.Second, func() error {
-			return checkDefault(n, want)
-		}); err != nil {
-			t.Fatal(err)
+	setDefaultAutoUpdate := func(send bool) {
+		modifyMu.Lock()
+		defer modifyMu.Unlock()
+		modifyFirstMapResponse = func(mr *tailcfg.MapResponse, req *tailcfg.MapRequest) {
+			if mr.Node == nil {
+				mr.Node = &tailcfg.Node{}
+			}
+			if useCap {
+				if mr.Node.CapMap == nil {
+					mr.Node.CapMap = make(tailcfg.NodeCapMap)
+				}
+				mr.Node.CapMap[tailcfg.NodeAttrDefaultAutoUpdate] = []tailcfg.RawMessage{
+					tailcfg.RawMessage(fmt.Sprintf("%t", send)),
+				}
+			} else {
+				mr.DeprecatedDefaultAutoUpdate = opt.NewBool(send)
+			}
 		}
 	}
 
@@ -1165,29 +1472,54 @@ func TestAutoUpdateDefaults(t *testing.T) {
 		{
 			desc: "tailnet-default-false",
 			run: func(t *testing.T, n *TestNode) {
-				// First received default "false".
-				sendAndCheckDefault(t, n, false, false)
-				// Should not be changed even if sent "true" later.
-				sendAndCheckDefault(t, n, true, false)
+
+				// First the server sends "false", and client should remember that.
+				setDefaultAutoUpdate(false)
+				n.MustUp()
+				n.AwaitRunning()
+				checkDefault(n, false)
+
+				// Now we disconnect and change the server to send "true", which
+				// the client should ignore, having previously remembered
+				// "false".
+				n.MustDown()
+				setDefaultAutoUpdate(true) // control sends default "true"
+				n.MustUp()
+				n.AwaitRunning()
+				checkDefault(n, false) // still false
+
 				// But can be changed explicitly by the user.
 				if out, err := n.TailscaleForOutput("set", "--auto-update").CombinedOutput(); err != nil {
 					t.Fatalf("failed to enable auto-update on node: %v\noutput: %s", err, out)
 				}
-				sendAndCheckDefault(t, n, false, true)
+				checkDefault(n, true)
 			},
 		},
 		{
 			desc: "tailnet-default-true",
 			run: func(t *testing.T, n *TestNode) {
-				// First received default "true".
-				sendAndCheckDefault(t, n, true, true)
-				// Should not be changed even if sent "false" later.
-				sendAndCheckDefault(t, n, false, true)
+				// Same as above but starting with default "true".
+
+				// First the server sends "true", and client should remember that.
+				setDefaultAutoUpdate(true)
+				n.MustUp()
+				n.AwaitRunning()
+				checkDefault(n, true)
+
+				// Now we disconnect and change the server to send "false", which
+				// the client should ignore, having previously remembered
+				// "true".
+				n.MustDown()
+				setDefaultAutoUpdate(false) // control sends default "false"
+				n.MustUp()
+				n.AwaitRunning()
+				checkDefault(n, true) // still true
+
 				// But can be changed explicitly by the user.
 				if out, err := n.TailscaleForOutput("set", "--auto-update=false").CombinedOutput(); err != nil {
-					t.Fatalf("failed to disable auto-update on node: %v\noutput: %s", err, out)
+					t.Fatalf("failed to enable auto-update on node: %v\noutput: %s", err, out)
 				}
-				sendAndCheckDefault(t, n, true, false)
+				checkDefault(n, false)
 			},
 		},
 		{
@@ -1197,22 +1529,21 @@ func TestAutoUpdateDefaults(t *testing.T) {
 				if out, err := n.TailscaleForOutput("set", "--auto-update=false").CombinedOutput(); err != nil {
 					t.Fatalf("failed to disable auto-update on node: %v\noutput: %s", err, out)
 				}
-				// Defaults sent from control should be ignored.
-				sendAndCheckDefault(t, n, true, false)
-				sendAndCheckDefault(t, n, false, false)
+
+				setDefaultAutoUpdate(true)
+				n.MustUp()
+				n.AwaitRunning()
+				checkDefault(n, false)
 			},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.desc, func(t *testing.T) {
 			n := NewTestNode(t, env)
+			n.allowUpdates = true
 			d := n.StartDaemon()
 			defer d.MustCleanShutdown(t)
-
 			n.AwaitResponding()
-			n.MustUp()
-			n.AwaitRunning()
-
 			tt.run(t, n)
 		})
 	}
@@ -1643,6 +1974,7 @@ func TestEncryptStateMigration(t *testing.T) {
 // relay between all 3 nodes, and "tailscale debug peer-relay-sessions" returns
 // expected values.
 func TestPeerRelayPing(t *testing.T) {
+	flakytest.Mark(t, "https://github.com/tailscale/tailscale/issues/17251")
 	tstest.Shard(t)
 	tstest.Parallel(t)
 
@@ -1842,16 +2174,10 @@ func TestC2NDebugNetmap(t *testing.T) {
 		var current netmap.NetworkMap
 		must.Do(json.Unmarshal(resp.Current, &current))
 
-		if !current.PrivateKey.IsZero() {
-			t.Errorf("current netmap has non-zero private key: %v", current.PrivateKey)
-		}
 		// Check candidate netmap if we sent a map response.
 		if cand != nil {
 			var candidate netmap.NetworkMap
 			must.Do(json.Unmarshal(resp.Candidate, &candidate))
-			if !candidate.PrivateKey.IsZero() {
-				t.Errorf("candidate netmap has non-zero private key: %v", candidate.PrivateKey)
-			}
 			if diff := cmp.Diff(current.SelfNode, candidate.SelfNode); diff != "" {
 				t.Errorf("SelfNode differs (-current +candidate):\n%s", diff)
 			}
@@ -1925,4 +2251,152 @@ func TestC2NDebugNetmap(t *testing.T) {
 	if len(nm.Peers) != 1 || !nm.Peers[0].Online().Get() {
 		t.Errorf("expected peer to be online; got %+v", nm.Peers[0].AsStruct())
 	}
+}
+
+func TestTailnetLock(t *testing.T) {
+
+	// If you run `tailscale lock log` on a node where Tailnet Lock isn't
+	// enabled, you get an error explaining that.
+	t.Run("log-when-not-enabled", func(t *testing.T) {
+		tstest.Shard(t)
+		t.Parallel()
+
+		env := NewTestEnv(t)
+		n1 := NewTestNode(t, env)
+		d1 := n1.StartDaemon()
+		defer d1.MustCleanShutdown(t)
+
+		n1.MustUp()
+		n1.AwaitRunning()
+
+		cmdArgs := []string{"lock", "log"}
+		t.Logf("Running command: %s", strings.Join(cmdArgs, " "))
+
+		var outBuf, errBuf bytes.Buffer
+
+		cmd := n1.Tailscale(cmdArgs...)
+		cmd.Stdout = &outBuf
+		cmd.Stderr = &errBuf
+
+		if err := cmd.Run(); !isNonZeroExitCode(err) {
+			t.Fatalf("command did not fail with non-zero exit code: %q", err)
+		}
+
+		if outBuf.String() != "" {
+			t.Fatalf("stdout: want '', got %q", outBuf.String())
+		}
+
+		wantErr := "Tailnet Lock is not enabled\n"
+		if errBuf.String() != wantErr {
+			t.Fatalf("stderr: want %q, got %q", wantErr, errBuf.String())
+		}
+	})
+
+	// If you create a tailnet with two signed nodes and one unsigned,
+	// the signed nodes can talk to each other but the unsigned node cannot
+	// talk to anybody.
+	t.Run("node-connectivity", func(t *testing.T) {
+		tstest.Shard(t)
+		t.Parallel()
+
+		env := NewTestEnv(t)
+		env.Control.DefaultNodeCapabilities = &tailcfg.NodeCapMap{
+			tailcfg.CapabilityTailnetLock: []tailcfg.RawMessage{},
+		}
+
+		// Start two nodes which will be our signing nodes.
+		signing1 := NewTestNode(t, env)
+		signing2 := NewTestNode(t, env)
+
+		nodes := []*TestNode{signing1, signing2}
+		for _, n := range nodes {
+			d := n.StartDaemon()
+			defer d.MustCleanShutdown(t)
+
+			n.MustUp()
+			n.AwaitRunning()
+		}
+
+		// Initiate Tailnet Lock with the two signing nodes.
+		initCmd := signing1.Tailscale("lock", "init",
+			"--gen-disablements", "10",
+			"--confirm",
+			signing1.NLPublicKey(), signing2.NLPublicKey(),
+		)
+		out, err := initCmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("init command failed: %q\noutput=%v", err, string(out))
+		}
+
+		// Check that the two signing nodes can ping each other
+		if err := signing1.Ping(signing2); err != nil {
+			t.Fatalf("ping signing1 -> signing2: %v", err)
+		}
+		if err := signing2.Ping(signing1); err != nil {
+			t.Fatalf("ping signing2 -> signing1: %v", err)
+		}
+
+		// Create and start a third node
+		node3 := NewTestNode(t, env)
+		d3 := node3.StartDaemon()
+		defer d3.MustCleanShutdown(t)
+		node3.MustUp()
+		node3.AwaitRunning()
+
+		if err := signing1.Ping(node3); err == nil {
+			t.Fatal("ping signing1 -> node3: expected err, but succeeded")
+		}
+		if err := node3.Ping(signing1); err == nil {
+			t.Fatal("ping node3 -> signing1: expected err, but succeeded")
+		}
+
+		// Sign node3, and check the nodes can now talk to each other
+		signCmd := signing1.Tailscale("lock", "sign", node3.PublicKey())
+		out, err = signCmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("sign command failed: %q\noutput = %v", err, string(out))
+		}
+
+		if err := signing1.Ping(node3); err != nil {
+			t.Fatalf("ping signing1 -> node3: expected success, got err: %v", err)
+		}
+		if err := node3.Ping(signing1); err != nil {
+			t.Fatalf("ping node3 -> signing1: expected success, got err: %v", err)
+		}
+	})
+}
+
+func TestNodeWithBadStateFile(t *testing.T) {
+	tstest.Shard(t)
+	tstest.Parallel(t)
+	env := NewTestEnv(t)
+	n1 := NewTestNode(t, env)
+	if err := os.WriteFile(n1.stateFile, []byte("bad json"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	d1 := n1.StartDaemon()
+	n1.AwaitResponding()
+
+	// Make sure the health message shows up in status output.
+	n1.AwaitBackendState("NoState")
+	st := n1.MustStatus()
+	wantHealth := ipn.StateStoreHealth.Text(health.Args{health.ArgError: ""})
+	if !slices.ContainsFunc(st.Health, func(m string) bool { return strings.HasPrefix(m, wantHealth) }) {
+		t.Errorf("Status does not contain expected health message %q\ngot health messages: %q", wantHealth, st.Health)
+	}
+
+	// Make sure login attempts are rejected.
+	cmd := n1.Tailscale("up", "--login-server="+n1.env.ControlURL())
+	t.Logf("Running %v ...", cmd)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("up succeeded with output %q", out)
+	}
+	wantOut := "cannot start backend when state store is unhealthy"
+	if !strings.Contains(string(out), wantOut) {
+		t.Fatalf("got up output:\n%s\nwant:\n%s", string(out), wantOut)
+	}
+
+	d1.MustCleanShutdown(t)
 }

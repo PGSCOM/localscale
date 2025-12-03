@@ -38,6 +38,7 @@ import (
 	"tailscale.com/net/udprelay/status"
 	"tailscale.com/paths"
 	"tailscale.com/safesocket"
+	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/appctype"
 	"tailscale.com/types/dnstype"
@@ -381,6 +382,9 @@ func (lc *Client) UserMetrics(ctx context.Context) ([]byte, error) {
 //
 // IncrementCounter does not support gauge metrics or negative delta values.
 func (lc *Client) IncrementCounter(ctx context.Context, name string, delta int) error {
+	if !buildfeatures.HasClientMetrics {
+		return nil
+	}
 	type metricUpdate struct {
 		Name  string `json:"name"`
 		Type  string `json:"type"`
@@ -593,6 +597,19 @@ func (lc *Client) DebugResultJSON(ctx context.Context, action string) (any, erro
 	return x, nil
 }
 
+// QueryOptionalFeatures queries the optional features supported by the Tailscale daemon.
+func (lc *Client) QueryOptionalFeatures(ctx context.Context) (*apitype.OptionalFeatures, error) {
+	body, err := lc.send(ctx, "POST", "/localapi/v0/debug-optional-features", 200, nil)
+	if err != nil {
+		return nil, fmt.Errorf("error %w: %s", err, body)
+	}
+	var x apitype.OptionalFeatures
+	if err := json.Unmarshal(body, &x); err != nil {
+		return nil, err
+	}
+	return &x, nil
+}
+
 // SetDevStoreKeyValue set a statestore key/value. It's only meant for development.
 // The schema (including when keys are re-read) is not a stable interface.
 func (lc *Client) SetDevStoreKeyValue(ctx context.Context, key, value string) error {
@@ -752,6 +769,9 @@ func (lc *Client) PushFile(ctx context.Context, target tailcfg.StableNodeID, siz
 // machine is properly configured to forward IP packets as a subnet router
 // or exit node.
 func (lc *Client) CheckIPForwarding(ctx context.Context) error {
+	if !buildfeatures.HasAdvertiseRoutes {
+		return nil
+	}
 	body, err := lc.get200(ctx, "/localapi/v0/check-ip-forwarding")
 	if err != nil {
 		return err
@@ -1344,7 +1364,7 @@ type IPNBusWatcher struct {
 	httpRes *http.Response
 	dec     *json.Decoder
 
-	mu     sync.Mutex
+	mu     syncs.Mutex
 	closed bool
 }
 
@@ -1379,6 +1399,23 @@ func (lc *Client) SuggestExitNode(ctx context.Context) (apitype.ExitNodeSuggesti
 		return apitype.ExitNodeSuggestionResponse{}, err
 	}
 	return decodeJSON[apitype.ExitNodeSuggestionResponse](body)
+}
+
+// CheckSOMarkInUse reports whether the socket mark option is in use. This will only
+// be true if tailscale is running on Linux and tailscaled uses SO_MARK.
+func (lc *Client) CheckSOMarkInUse(ctx context.Context) (bool, error) {
+	body, err := lc.get200(ctx, "/localapi/v0/check-so-mark-in-use")
+	if err != nil {
+		return false, err
+	}
+	var res struct {
+		UseSOMark bool `json:"useSoMark"`
+	}
+
+	if err := json.Unmarshal(body, &res); err != nil {
+		return false, fmt.Errorf("invalid JSON from check-so-mark-in-use: %w", err)
+	}
+	return res.UseSOMark, nil
 }
 
 // ShutdownTailscaled requests a graceful shutdown of tailscaled.

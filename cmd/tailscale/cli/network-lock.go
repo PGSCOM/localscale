@@ -10,10 +10,11 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
+	jsonv1 "encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/mattn/go-isatty"
 	"github.com/peterbourgon/ff/v3/ffcli"
+	"tailscale.com/cmd/tailscale/cli/jsonoutput"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tka"
 	"tailscale.com/tsconst"
@@ -219,24 +221,24 @@ func runNetworkLockStatus(ctx context.Context, args []string) error {
 	}
 
 	if nlStatusArgs.json {
-		enc := json.NewEncoder(os.Stdout)
+		enc := jsonv1.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
 		return enc.Encode(st)
 	}
 
 	if st.Enabled {
-		fmt.Println("Tailnet lock is ENABLED.")
+		fmt.Println("Tailnet Lock is ENABLED.")
 	} else {
-		fmt.Println("Tailnet lock is NOT enabled.")
+		fmt.Println("Tailnet Lock is NOT enabled.")
 	}
 	fmt.Println()
 
 	if st.Enabled && st.NodeKey != nil && !st.PublicKey.IsZero() {
 		if st.NodeKeySigned {
-			fmt.Println("This node is accessible under tailnet lock. Node signature:")
+			fmt.Println("This node is accessible under Tailnet Lock. Node signature:")
 			fmt.Println(st.NodeKeySignature.String())
 		} else {
-			fmt.Println("This node is LOCKED OUT by tailnet-lock, and action is required to establish connectivity.")
+			fmt.Println("This node is LOCKED OUT by Tailnet Lock, and action is required to establish connectivity.")
 			fmt.Printf("Run the following command on a node with a trusted key:\n\ttailscale lock sign %v %s\n", st.NodeKey, st.PublicKey.CLIString())
 		}
 		fmt.Println()
@@ -600,7 +602,7 @@ func runNetworkLockDisablementKDF(ctx context.Context, args []string) error {
 
 var nlLogArgs struct {
 	limit int
-	json  bool
+	json  jsonoutput.JSONSchemaVersion
 }
 
 var nlLogCmd = &ffcli.Command{
@@ -612,7 +614,7 @@ var nlLogCmd = &ffcli.Command{
 	FlagSet: (func() *flag.FlagSet {
 		fs := newFlagSet("lock log")
 		fs.IntVar(&nlLogArgs.limit, "limit", 50, "max number of updates to list")
-		fs.BoolVar(&nlLogArgs.json, "json", false, "output in JSON format (WARNING: format subject to change)")
+		fs.Var(&nlLogArgs.json, "json", "output in JSON format")
 		return fs
 	})(),
 }
@@ -678,7 +680,7 @@ func nlDescribeUpdate(update ipnstate.NetworkLockUpdate, color bool) (string, er
 
 	default:
 		// Print a JSON encoding of the AUM as a fallback.
-		e := json.NewEncoder(&stanza)
+		e := jsonv1.NewEncoder(&stanza)
 		e.SetIndent("", "\t")
 		if err := e.Encode(aum); err != nil {
 			return "", err
@@ -690,17 +692,32 @@ func nlDescribeUpdate(update ipnstate.NetworkLockUpdate, color bool) (string, er
 }
 
 func runNetworkLockLog(ctx context.Context, args []string) error {
+	st, err := localClient.NetworkLockStatus(ctx)
+	if err != nil {
+		return fixTailscaledConnectError(err)
+	}
+	if !st.Enabled {
+		return errors.New("Tailnet Lock is not enabled")
+	}
+
 	updates, err := localClient.NetworkLockLog(ctx, nlLogArgs.limit)
 	if err != nil {
 		return fixTailscaledConnectError(err)
 	}
-	if nlLogArgs.json {
-		enc := json.NewEncoder(Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(updates)
-	}
 
 	out, useColor := colorableOutput()
+
+	return printNetworkLockLog(updates, out, nlLogArgs.json, useColor)
+}
+
+func printNetworkLockLog(updates []ipnstate.NetworkLockUpdate, out io.Writer, jsonSchema jsonoutput.JSONSchemaVersion, useColor bool) error {
+	if jsonSchema.IsSet {
+		if jsonSchema.Value == 1 {
+			return jsonoutput.PrintNetworkLockJSONV1(out, updates)
+		} else {
+			return fmt.Errorf("unrecognised version: %q", jsonSchema.Value)
+		}
+	}
 
 	for _, update := range updates {
 		stanza, err := nlDescribeUpdate(update, useColor)

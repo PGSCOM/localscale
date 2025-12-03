@@ -4,10 +4,11 @@
 package controlclient
 
 import (
-	"bufio"
 	"bytes"
 	"cmp"
 	"context"
+	"crypto"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -22,7 +23,6 @@ import (
 	"runtime"
 	"slices"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -43,8 +43,8 @@ import (
 	"tailscale.com/net/netx"
 	"tailscale.com/net/tlsdial"
 	"tailscale.com/net/tsdial"
+	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
-	"tailscale.com/tempfork/httprec"
 	"tailscale.com/tka"
 	"tailscale.com/tstime"
 	"tailscale.com/types/key"
@@ -74,7 +74,6 @@ type Direct struct {
 	logf                  logger.Logf
 	netMon                *netmon.Monitor // non-nil
 	health                *health.Tracker
-	discoPubKey           key.DiscoPublic
 	busClient             *eventbus.Client
 	clientVersionPub      *eventbus.Publisher[tailcfg.ClientVersion]
 	autoUpdatePub         *eventbus.Publisher[AutoUpdate]
@@ -92,9 +91,10 @@ type Direct struct {
 
 	dialPlan ControlDialPlanner // can be nil
 
-	mu              sync.Mutex        // mutex guards the following fields
+	mu              syncs.Mutex       // mutex guards the following fields
 	serverLegacyKey key.MachinePublic // original ("legacy") nacl crypto_box-based public key; only used for signRegisterRequest on Windows now
 	serverNoiseKey  key.MachinePublic
+	discoPubKey     key.DiscoPublic // protected by mu; can be updated via [SetDiscoPublicKey]
 
 	sfGroup     singleflight.Group[struct{}, *ts2021.Client] // protects noiseClient creation.
 	noiseClient *ts2021.Client                               // also protected by mu
@@ -115,6 +115,9 @@ type Direct struct {
 
 // Observer is implemented by users of the control client (such as LocalBackend)
 // to get notified of changes in the control client's status.
+//
+// If an implementation of Observer also implements [NetmapDeltaUpdater], they get
+// delta updates as well as full netmap updates.
 type Observer interface {
 	// SetControlClientStatus is called when the client has a new status to
 	// report. The Client is provided to allow the Observer to track which
@@ -141,10 +144,19 @@ type Options struct {
 	Dialer               *tsdial.Dialer      // non-nil
 	C2NHandler           http.Handler        // or nil
 	ControlKnobs         *controlknobs.Knobs // or nil to ignore
-	Bus                  *eventbus.Bus
+	Bus                  *eventbus.Bus       // non-nil, for setting up publishers
+
+	SkipStartForTests bool // if true, don't call [Auto.Start] to avoid any background goroutines (for tests only)
+
+	// StartPaused indicates whether the client should start in a paused state
+	// where it doesn't do network requests. This primarily exists for testing
+	// but not necessarily "go test" tests, so it isn't restricted to only
+	// being used in tests.
+	StartPaused bool
 
 	// Observer is called when there's a change in status to report
 	// from the control client.
+	// If nil, no status updates are reported.
 	Observer Observer
 
 	// SkipIPForwardingCheck declares that the host's IP
@@ -304,7 +316,6 @@ func NewDirect(opts Options) (*Direct, error) {
 		logf:                  opts.Logf,
 		persist:               opts.Persist.View(),
 		authKey:               opts.AuthKey,
-		discoPubKey:           opts.DiscoPublicKey,
 		debugFlags:            opts.DebugFlags,
 		netMon:                netMon,
 		health:                opts.HealthTracker,
@@ -317,6 +328,7 @@ func NewDirect(opts Options) (*Direct, error) {
 		dnsCache:              dnsCache,
 		dialPlan:              opts.DialPlan,
 	}
+	c.discoPubKey = opts.DiscoPublicKey
 	c.closedCtx, c.closeCtx = context.WithCancel(context.Background())
 
 	c.controlClientID = nextControlClientID.Add(1)
@@ -606,6 +618,7 @@ func (c *Direct) doLogin(ctx context.Context, opt loginOpt) (mustRegen bool, new
 	if persist.NetworkLockKey.IsZero() {
 		persist.NetworkLockKey = key.NewNLPrivate()
 	}
+
 	nlPub := persist.NetworkLockKey.Public()
 
 	if tryingNewKey.IsZero() {
@@ -840,6 +853,14 @@ func (c *Direct) SendUpdate(ctx context.Context) error {
 	return c.sendMapRequest(ctx, false, nil)
 }
 
+// SetDiscoPublicKey updates the disco public key in local state.
+// It does not implicitly trigger [SendUpdate]; callers should arrange for that.
+func (c *Direct) SetDiscoPublicKey(key key.DiscoPublic) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.discoPubKey = key
+}
+
 // ClientID returns the controlClientID of the controlClient.
 func (c *Direct) ClientID() int64 {
 	return c.controlClientID
@@ -889,6 +910,7 @@ func (c *Direct) sendMapRequest(ctx context.Context, isStreaming bool, nu Netmap
 	persist := c.persist
 	serverURL := c.serverURL
 	serverNoiseKey := c.serverNoiseKey
+	discoKey := c.discoPubKey
 	hi := c.hostInfoLocked()
 	backendLogID := hi.BackendLogID
 	connectionHandleForTest := c.connectionHandleForTest
@@ -932,11 +954,12 @@ func (c *Direct) sendMapRequest(ctx context.Context, isStreaming bool, nu Netmap
 	}
 
 	nodeKey := persist.PublicNodeKey()
+
 	request := &tailcfg.MapRequest{
 		Version:                 tailcfg.CurrentCapabilityVersion,
 		KeepAlive:               true,
 		NodeKey:                 nodeKey,
-		DiscoKey:                c.discoPubKey,
+		DiscoKey:                discoKey,
 		Endpoints:               eps,
 		EndpointTypes:           epTypes,
 		Stream:                  isStreaming,
@@ -946,8 +969,29 @@ func (c *Direct) sendMapRequest(ctx context.Context, isStreaming bool, nu Netmap
 		TKAHead:                 tkaHead,
 		ConnectionHandleForTest: connectionHandleForTest,
 	}
+
+	// If we have a hardware attestation key, sign the node key with it and send
+	// the key & signature in the map request.
+	if buildfeatures.HasTPM {
+		if k := persist.AsStruct().AttestationKey; k != nil && !k.IsZero() {
+			hwPub := key.HardwareAttestationPublicFromPlatformKey(k)
+			request.HardwareAttestationKey = hwPub
+
+			t := c.clock.Now()
+			msg := fmt.Sprintf("%d|%s", t.Unix(), nodeKey.String())
+			digest := sha256.Sum256([]byte(msg))
+			sig, err := k.Sign(nil, digest[:], crypto.SHA256)
+			if err != nil {
+				c.logf("failed to sign node key with hardware attestation key: %v", err)
+			} else {
+				request.HardwareAttestationKeySignature = sig
+				request.HardwareAttestationKeySignatureTimestamp = t
+			}
+		}
+	}
+
 	var extraDebugFlags []string
-	if hi != nil && c.netMon != nil && !c.skipIPForwardingCheck &&
+	if buildfeatures.HasAdvertiseRoutes && hi != nil && c.netMon != nil && !c.skipIPForwardingCheck &&
 		ipForwardingBroken(hi.RoutableIPs, c.netMon.InterfaceState()) {
 		extraDebugFlags = append(extraDebugFlags, "warn-ip-forwarding-off")
 	}
@@ -1059,7 +1103,7 @@ func (c *Direct) sendMapRequest(ctx context.Context, isStreaming bool, nu Netmap
 			c.persist = newPersist.View()
 			persist = c.persist
 		}
-		c.expiry = nm.Expiry
+		c.expiry = nm.SelfKeyExpiry()
 	}
 
 	// gotNonKeepAliveMessage is whether we've yet received a MapResponse message without
@@ -1140,7 +1184,19 @@ func (c *Direct) sendMapRequest(ctx context.Context, isStreaming bool, nu Netmap
 			metricMapResponseKeepAlives.Add(1)
 			continue
 		}
-		if au, ok := resp.DefaultAutoUpdate.Get(); ok {
+
+		// DefaultAutoUpdate in its CapMap and deprecated top-level field forms.
+		if self := resp.Node; self != nil {
+			for _, v := range self.CapMap[tailcfg.NodeAttrDefaultAutoUpdate] {
+				switch v {
+				case "true", "false":
+					c.autoUpdatePub.Publish(AutoUpdate{c.controlClientID, v == "true"})
+				default:
+					c.logf("netmap: [unexpected] unknown %s in CapMap: %q", tailcfg.NodeAttrDefaultAutoUpdate, v)
+				}
+			}
+		}
+		if au, ok := resp.DeprecatedDefaultAutoUpdate.Get(); ok {
 			c.autoUpdatePub.Publish(AutoUpdate{c.controlClientID, au})
 		}
 
@@ -1389,6 +1445,10 @@ func (c *Direct) isUniquePingRequest(pr *tailcfg.PingRequest) bool {
 	return true
 }
 
+// HookAnswerC2NPing is where feature/c2n conditionally registers support
+// for handling C2N (control-to-node) HTTP requests.
+var HookAnswerC2NPing feature.Hook[func(logger.Logf, http.Handler, *http.Client, *tailcfg.PingRequest)]
+
 func (c *Direct) answerPing(pr *tailcfg.PingRequest) {
 	httpc := c.httpc
 	useNoise := pr.URLIsNoise || pr.Types == "c2n"
@@ -1416,7 +1476,9 @@ func (c *Direct) answerPing(pr *tailcfg.PingRequest) {
 			c.logf("refusing to answer c2n ping without noise")
 			return
 		}
-		answerC2NPing(c.logf, c.c2nHandler, httpc, pr)
+		if f, ok := HookAnswerC2NPing.GetOk(); ok {
+			f(c.logf, c.c2nHandler, httpc, pr)
+		}
 		return
 	}
 	for _, t := range strings.Split(pr.Types, ",") {
@@ -1448,54 +1510,6 @@ func answerHeadPing(logf logger.Logf, c *http.Client, pr *tailcfg.PingRequest) {
 		logf("answerHeadPing error: %v to %v (after %v)", err, pr.URL, d)
 	} else if pr.Log {
 		logf("answerHeadPing complete to %v (after %v)", pr.URL, d)
-	}
-}
-
-func answerC2NPing(logf logger.Logf, c2nHandler http.Handler, c *http.Client, pr *tailcfg.PingRequest) {
-	if c2nHandler == nil {
-		logf("answerC2NPing: c2nHandler not defined")
-		return
-	}
-	hreq, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(pr.Payload)))
-	if err != nil {
-		logf("answerC2NPing: ReadRequest: %v", err)
-		return
-	}
-	if pr.Log {
-		logf("answerC2NPing: got c2n request for %v ...", hreq.RequestURI)
-	}
-	handlerTimeout := time.Minute
-	if v := hreq.Header.Get("C2n-Handler-Timeout"); v != "" {
-		handlerTimeout, _ = time.ParseDuration(v)
-	}
-	handlerCtx, cancel := context.WithTimeout(context.Background(), handlerTimeout)
-	defer cancel()
-	hreq = hreq.WithContext(handlerCtx)
-	rec := httprec.NewRecorder()
-	c2nHandler.ServeHTTP(rec, hreq)
-	cancel()
-
-	c2nResBuf := new(bytes.Buffer)
-	rec.Result().Write(c2nResBuf)
-
-	replyCtx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(replyCtx, "POST", pr.URL, c2nResBuf)
-	if err != nil {
-		logf("answerC2NPing: NewRequestWithContext: %v", err)
-		return
-	}
-	if pr.Log {
-		logf("answerC2NPing: sending POST ping to %v ...", pr.URL)
-	}
-	t0 := clock.Now()
-	_, err = c.Do(req)
-	d := time.Since(t0).Round(time.Millisecond)
-	if err != nil {
-		logf("answerC2NPing error: %v to %v (after %v)", err, pr.URL, d)
-	} else if pr.Log {
-		logf("answerC2NPing complete to %v (after %v)", pr.URL, d)
 	}
 }
 

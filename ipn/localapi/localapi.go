@@ -7,6 +7,7 @@ package localapi
 import (
 	"bytes"
 	"cmp"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -34,6 +35,7 @@ import (
 	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/logtail"
+	"tailscale.com/net/netns"
 	"tailscale.com/net/netutil"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstime"
@@ -71,45 +73,40 @@ var handler = map[string]LocalAPIHandler{
 
 	// The other /localapi/v0/NAME handlers are exact matches and contain only NAME
 	// without a trailing slash:
-	"alpha-set-device-attrs":       (*Handler).serveSetDeviceAttrs, // see tailscale/corp#24690
-	"check-ip-forwarding":          (*Handler).serveCheckIPForwarding,
-	"check-prefs":                  (*Handler).serveCheckPrefs,
-	"check-reverse-path-filtering": (*Handler).serveCheckReversePathFiltering,
-	"check-udp-gro-forwarding":     (*Handler).serveCheckUDPGROForwarding,
-	"derpmap":                      (*Handler).serveDERPMap,
-	"dial":                         (*Handler).serveDial,
-	"disconnect-control":           (*Handler).disconnectControl,
-	"dns-osconfig":                 (*Handler).serveDNSOSConfig,
-	"dns-query":                    (*Handler).serveDNSQuery,
-	"goroutines":                   (*Handler).serveGoroutines,
-	"handle-push-message":          (*Handler).serveHandlePushMessage,
-	"id-token":                     (*Handler).serveIDToken,
-	"login-interactive":            (*Handler).serveLoginInteractive,
-	"logout":                       (*Handler).serveLogout,
-	"logtap":                       (*Handler).serveLogTap,
-	"metrics":                      (*Handler).serveMetrics,
-	"ping":                         (*Handler).servePing,
-	"prefs":                        (*Handler).servePrefs,
-	"query-feature":                (*Handler).serveQueryFeature,
-	"reload-config":                (*Handler).reloadConfig,
-	"reset-auth":                   (*Handler).serveResetAuth,
-	"set-expiry-sooner":            (*Handler).serveSetExpirySooner,
-	"set-gui-visible":              (*Handler).serveSetGUIVisible,
-	"set-push-device-token":        (*Handler).serveSetPushDeviceToken,
-	"set-udp-gro-forwarding":       (*Handler).serveSetUDPGROForwarding,
-	"shutdown":                     (*Handler).serveShutdown,
-	"start":                        (*Handler).serveStart,
-	"status":                       (*Handler).serveStatus,
-	"update/check":                 (*Handler).serveUpdateCheck,
-	"upload-client-metrics":        (*Handler).serveUploadClientMetrics,
-	"usermetrics":                  (*Handler).serveUserMetrics,
-	"watch-ipn-bus":                (*Handler).serveWatchIPNBus,
-	"whois":                        (*Handler).serveWhoIs,
+	"check-prefs":          (*Handler).serveCheckPrefs,
+	"check-so-mark-in-use": (*Handler).serveCheckSOMarkInUse,
+	"derpmap":              (*Handler).serveDERPMap,
+	"goroutines":           (*Handler).serveGoroutines,
+	"login-interactive":    (*Handler).serveLoginInteractive,
+	"logout":               (*Handler).serveLogout,
+	"ping":                 (*Handler).servePing,
+	"prefs":                (*Handler).servePrefs,
+	"reload-config":        (*Handler).reloadConfig,
+	"reset-auth":           (*Handler).serveResetAuth,
+	"set-expiry-sooner":    (*Handler).serveSetExpirySooner,
+	"shutdown":             (*Handler).serveShutdown,
+	"start":                (*Handler).serveStart,
+	"status":               (*Handler).serveStatus,
+	"whois":                (*Handler).serveWhoIs,
 }
 
 func init() {
 	if buildfeatures.HasAppConnectors {
 		Register("appc-route-info", (*Handler).serveGetAppcRouteInfo)
+	}
+	if buildfeatures.HasAdvertiseRoutes {
+		Register("check-ip-forwarding", (*Handler).serveCheckIPForwarding)
+		Register("check-udp-gro-forwarding", (*Handler).serveCheckUDPGROForwarding)
+		Register("set-udp-gro-forwarding", (*Handler).serveSetUDPGROForwarding)
+	}
+	if buildfeatures.HasUseExitNode && runtime.GOOS == "linux" {
+		Register("check-reverse-path-filtering", (*Handler).serveCheckReversePathFiltering)
+	}
+	if buildfeatures.HasClientMetrics {
+		Register("upload-client-metrics", (*Handler).serveUploadClientMetrics)
+	}
+	if buildfeatures.HasClientUpdate {
+		Register("update/check", (*Handler).serveUpdateCheck)
 	}
 	if buildfeatures.HasUseExitNode {
 		Register("suggest-exit-node", (*Handler).serveSuggestExitNode)
@@ -121,6 +118,46 @@ func init() {
 	if buildfeatures.HasDebug {
 		Register("bugreport", (*Handler).serveBugReport)
 		Register("pprof", (*Handler).servePprof)
+	}
+	if buildfeatures.HasDebug || buildfeatures.HasServe {
+		Register("watch-ipn-bus", (*Handler).serveWatchIPNBus)
+	}
+	if buildfeatures.HasDNS {
+		Register("dns-osconfig", (*Handler).serveDNSOSConfig)
+		Register("dns-query", (*Handler).serveDNSQuery)
+	}
+	if buildfeatures.HasUserMetrics {
+		Register("usermetrics", (*Handler).serveUserMetrics)
+	}
+	if buildfeatures.HasServe {
+		Register("query-feature", (*Handler).serveQueryFeature)
+	}
+	if buildfeatures.HasOutboundProxy || buildfeatures.HasSSH {
+		Register("dial", (*Handler).serveDial)
+	}
+	if buildfeatures.HasClientMetrics || buildfeatures.HasDebug {
+		Register("metrics", (*Handler).serveMetrics)
+	}
+	if buildfeatures.HasDebug || buildfeatures.HasAdvertiseRoutes {
+		Register("disconnect-control", (*Handler).disconnectControl)
+	}
+	// Alpha/experimental/debug features. These should be moved to
+	// their own features if/when they graduate.
+	if buildfeatures.HasDebug {
+		Register("id-token", (*Handler).serveIDToken)
+		Register("alpha-set-device-attrs", (*Handler).serveSetDeviceAttrs) // see tailscale/corp#24690
+		Register("handle-push-message", (*Handler).serveHandlePushMessage)
+		Register("set-push-device-token", (*Handler).serveSetPushDeviceToken)
+	}
+	if buildfeatures.HasDebug || runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
+		Register("set-gui-visible", (*Handler).serveSetGUIVisible)
+	}
+	if buildfeatures.HasLogTail {
+		// TODO(bradfitz): separate out logtail tap functionality from upload
+		// functionality to make this possible? But seems unlikely people would
+		// want just this. They could "tail -f" or "journalctl -f" their logs
+		// themselves.
+		Register("logtap", (*Handler).serveLogTap)
 	}
 }
 
@@ -223,13 +260,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "auth required", http.StatusUnauthorized)
 			return
 		}
-		if pass != h.RequiredPassword {
+		if subtle.ConstantTimeCompare([]byte(pass), []byte(h.RequiredPassword)) == 0 {
 			metricInvalidRequests.Add(1)
 			http.Error(w, "bad password", http.StatusForbidden)
 			return
 		}
 	}
-	if fn, ok := handlerForPath(r.URL.Path); ok {
+	if fn, route, ok := handlerForPath(r.URL.Path); ok {
+		h.logRequest(r.Method, route)
 		fn(h, w, r)
 	} else {
 		http.NotFound(w, r)
@@ -265,9 +303,9 @@ func (h *Handler) validHost(hostname string) bool {
 
 // handlerForPath returns the LocalAPI handler for the provided Request.URI.Path.
 // (the path doesn't include any query parameters)
-func handlerForPath(urlPath string) (h LocalAPIHandler, ok bool) {
+func handlerForPath(urlPath string) (h LocalAPIHandler, route string, ok bool) {
 	if urlPath == "/" {
-		return (*Handler).serveLocalAPIRoot, true
+		return (*Handler).serveLocalAPIRoot, "/", true
 	}
 	suff, ok := strings.CutPrefix(urlPath, "/localapi/v0/")
 	if !ok {
@@ -275,22 +313,31 @@ func handlerForPath(urlPath string) (h LocalAPIHandler, ok bool) {
 		// to people that they're not necessarily stable APIs. In practice we'll
 		// probably need to keep them pretty stable anyway, but for now treat
 		// them as an internal implementation detail.
-		return nil, false
+		return nil, "", false
 	}
 	if fn, ok := handler[suff]; ok {
 		// Here we match exact handler suffixes like "status" or ones with a
 		// slash already in their name, like "tka/status".
-		return fn, true
+		return fn, "/localapi/v0/" + suff, true
 	}
 	// Otherwise, it might be a prefix match like "files/*" which we look up
 	// by the prefix including first trailing slash.
 	if i := strings.IndexByte(suff, '/'); i != -1 {
 		suff = suff[:i+1]
 		if fn, ok := handler[suff]; ok {
-			return fn, true
+			return fn, "/localapi/v0/" + suff, true
 		}
 	}
-	return nil, false
+	return nil, "", false
+}
+
+func (h *Handler) logRequest(method, route string) {
+	switch method {
+	case httpm.GET, httpm.HEAD, httpm.OPTIONS:
+		// don't log safe methods
+	default:
+		h.Logf("localapi: [%s] %s", method, route)
+	}
 }
 
 func (*Handler) serveLocalAPIRoot(w http.ResponseWriter, r *http.Request) {
@@ -390,7 +437,7 @@ func (h *Handler) serveBugReport(w http.ResponseWriter, r *http.Request) {
 	// OS-specific details
 	h.logf.JSON(1, "UserBugReportOS", osdiag.SupportInfo(osdiag.LogSupportInfoReasonBugReport))
 
-	// Tailnet lock details
+	// Tailnet Lock details
 	st := h.b.NetworkLockStatus()
 	if st.Enabled {
 		h.logf.JSON(1, "UserBugReportTailnetLockStatus", st)
@@ -574,15 +621,6 @@ func (h *Handler) serveGoroutines(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) serveLogTap(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	if !buildfeatures.HasLogTail {
-		// TODO(bradfitz): separate out logtail tap functionality from upload
-		// functionality to make this possible? But seems unlikely people would
-		// want just this. They could "tail -f" or "journalctl -f" their logs
-		// themselves.
-		http.Error(w, "logtap not supported in this build", http.StatusNotImplemented)
-		return
-	}
-
 	// Require write access (~root) as the logs could contain something
 	// sensitive.
 	if !h.PermitWrite {
@@ -656,7 +694,7 @@ func (h *Handler) servePprof(w http.ResponseWriter, r *http.Request) {
 
 // disconnectControl is the handler for local API /disconnect-control endpoint that shuts down control client, so that
 // node no longer communicates with control. Doing this makes control consider this node inactive. This can be used
-// before shutting down a replica of HA subnet  router or app connector deployments to ensure that control tells the
+// before shutting down a replica of HA subnet router or app connector deployments to ensure that control tells the
 // peers to switch over to another replica whilst still maintaining th existing peer connections.
 func (h *Handler) disconnectControl(w http.ResponseWriter, r *http.Request) {
 	if !h.PermitWrite {
@@ -721,6 +759,23 @@ func (h *Handler) serveCheckIPForwarding(w http.ResponseWriter, r *http.Request)
 		Warning string
 	}{
 		Warning: warning,
+	})
+}
+
+// serveCheckSOMarkInUse reports whether SO_MARK is in use on the linux while
+// running without TUN. For any other OS, it reports false.
+func (h *Handler) serveCheckSOMarkInUse(w http.ResponseWriter, r *http.Request) {
+	if !h.PermitRead {
+		http.Error(w, "SO_MARK check access denied", http.StatusForbidden)
+		return
+	}
+	usingSOMark := netns.UseSocketMark()
+	usingUserspaceNetworking := h.b.Sys().IsNetstack()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(struct {
+		UseSOMark bool
+	}{
+		UseSOMark: usingSOMark || usingUserspaceNetworking,
 	})
 }
 
@@ -851,14 +906,6 @@ func (h *Handler) serveWatchIPNBus(w http.ResponseWriter, r *http.Request) {
 		}
 		mask = ipn.NotifyWatchOpt(v)
 	}
-	// Users with only read access must request private key filtering. If they
-	// don't filter out private keys, require write access.
-	if (mask & ipn.NotifyNoPrivateKeys) == 0 {
-		if !h.PermitWrite {
-			http.Error(w, "watch IPN bus access denied, must set ipn.NotifyNoPrivateKeys when not running as admin/root or operator", http.StatusForbidden)
-			return
-		}
-	}
 
 	w.Header().Set("Content-Type", "application/json")
 	ctx := r.Context()
@@ -883,7 +930,10 @@ func (h *Handler) serveLoginInteractive(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "want POST", http.StatusBadRequest)
 		return
 	}
-	h.b.StartLoginInteractiveAs(r.Context(), h.Actor)
+	if err := h.b.StartLoginInteractiveAs(r.Context(), h.Actor); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
 	return
 }
@@ -900,6 +950,11 @@ func (h *Handler) serveStart(w http.ResponseWriter, r *http.Request) {
 	var o ipn.Options
 	if err := json.NewDecoder(r.Body).Decode(&o); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if h.b.HealthTracker().IsUnhealthy(ipn.StateStoreHealth) {
+		http.Error(w, "cannot start backend when state store is unhealthy", http.StatusInternalServerError)
 		return
 	}
 	err := h.b.Start(o)
@@ -1224,11 +1279,6 @@ func (h *Handler) serveHandlePushMessage(w http.ResponseWriter, r *http.Request)
 }
 
 func (h *Handler) serveUploadClientMetrics(w http.ResponseWriter, r *http.Request) {
-	if !buildfeatures.HasClientMetrics {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(struct{}{})
-		return
-	}
 	if r.Method != httpm.POST {
 		http.Error(w, "unsupported method", http.StatusMethodNotAllowed)
 		return
@@ -1492,13 +1542,6 @@ func (h *Handler) serveUpdateCheck(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "only GET allowed", http.StatusMethodNotAllowed)
 		return
 	}
-
-	if !feature.CanAutoUpdate() {
-		// if we don't support auto-update, just say that we're up to date
-		json.NewEncoder(w).Encode(tailcfg.ClientVersion{RunningLatest: true})
-		return
-	}
-
 	cv := h.b.StatusWithoutPeers().ClientVersion
 	// ipnstate.Status documentation notes that ClientVersion may be nil on some
 	// platforms where this information is unavailable. In that case, return a

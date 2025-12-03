@@ -26,6 +26,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/yaml"
+
 	tsoperator "tailscale.com/k8s-operator"
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
 	"tailscale.com/kube/kubetypes"
@@ -45,10 +46,7 @@ const (
 	messageMultipleDNSConfigsPresent = "Multiple DNSConfig resources found in cluster. Please ensure no more than one is present."
 
 	defaultNameserverImageRepo = "tailscale/k8s-nameserver"
-	// TODO (irbekrm): once we start publishing nameserver images for stable
-	// track, replace 'unstable' here with the version of this operator
-	// instance.
-	defaultNameserverImageTag = "unstable"
+	defaultNameserverImageTag  = "stable"
 )
 
 // NameserverReconciler knows how to create nameserver resources in cluster in
@@ -191,6 +189,9 @@ func (a *NameserverReconciler) maybeProvision(ctx context.Context, tsDNSCfg *tsa
 	if tsDNSCfg.Spec.Nameserver.Service != nil {
 		dCfg.clusterIP = tsDNSCfg.Spec.Nameserver.Service.ClusterIP
 	}
+	if tsDNSCfg.Spec.Nameserver.Pod != nil {
+		dCfg.tolerations = tsDNSCfg.Spec.Nameserver.Pod.Tolerations
+	}
 
 	for _, deployable := range []deployable{saDeployable, deployDeployable, svcDeployable, cmDeployable} {
 		if err := deployable.updateObj(ctx, dCfg, a.Client); err != nil {
@@ -217,13 +218,14 @@ type deployable struct {
 }
 
 type deployConfig struct {
-	replicas  int32
-	imageRepo string
-	imageTag  string
-	labels    map[string]string
-	ownerRefs []metav1.OwnerReference
-	namespace string
-	clusterIP string
+	replicas    int32
+	imageRepo   string
+	imageTag    string
+	labels      map[string]string
+	ownerRefs   []metav1.OwnerReference
+	namespace   string
+	clusterIP   string
+	tolerations []corev1.Toleration
 }
 
 var (
@@ -248,6 +250,7 @@ var (
 			d.ObjectMeta.Namespace = cfg.namespace
 			d.ObjectMeta.Labels = cfg.labels
 			d.ObjectMeta.OwnerReferences = cfg.ownerRefs
+			d.Spec.Template.Spec.Tolerations = cfg.tolerations
 			updateF := func(oldD *appsv1.Deployment) {
 				oldD.Spec = d.Spec
 			}

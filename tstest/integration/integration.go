@@ -576,6 +576,7 @@ type TestNode struct {
 	stateFile    string
 	upFlagGOOS   string // if non-empty, sets TS_DEBUG_UP_FLAG_GOOS for cmd/tailscale CLI
 	encryptState bool
+	allowUpdates bool
 
 	mu        sync.Mutex
 	onLogLine []func([]byte)
@@ -840,6 +841,9 @@ func (n *TestNode) StartDaemonAsIPNGOOS(ipnGOOS string) *Daemon {
 		"TS_DISABLE_PORTMAPPER=1", // shouldn't be needed; test is all localhost
 		"TS_DEBUG_LOG_RATE=all",
 	)
+	if n.allowUpdates {
+		cmd.Env = append(cmd.Env, "TS_TEST_ALLOW_AUTO_UPDATE=1")
+	}
 	if n.env.loopbackPort != nil {
 		cmd.Env = append(cmd.Env, "TS_DEBUG_NETSTACK_LOOPBACK_PORT="+strconv.Itoa(*n.env.loopbackPort))
 	}
@@ -914,7 +918,7 @@ func (n *TestNode) Ping(otherNode *TestNode) error {
 	t := n.env.t
 	ip := otherNode.AwaitIP4().String()
 	t.Logf("Running ping %v (from %v)...", ip, n.AwaitIP4())
-	return n.Tailscale("ping", ip).Run()
+	return n.Tailscale("ping", "--timeout=1s", ip).Run()
 }
 
 // AwaitListening waits for the tailscaled to be serving local clients
@@ -1073,6 +1077,46 @@ func (n *TestNode) MustStatus() *ipnstate.Status {
 	return st
 }
 
+// PublicKey returns the hex-encoded public key of this node,
+// e.g. `nodekey:123456abc`
+func (n *TestNode) PublicKey() string {
+	tb := n.env.t
+	tb.Helper()
+	cmd := n.Tailscale("status", "--json")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		tb.Fatalf("running `tailscale status`: %v, %s", err, out)
+	}
+
+	type Self struct{ PublicKey string }
+	type StatusOutput struct{ Self Self }
+
+	var st StatusOutput
+	if err := json.Unmarshal(out, &st); err != nil {
+		tb.Fatalf("decoding `tailscale status` JSON: %v\njson:\n%s", err, out)
+	}
+	return st.Self.PublicKey
+}
+
+// NLPublicKey returns the hex-encoded network lock public key of
+// this node, e.g. `tlpub:123456abc`
+func (n *TestNode) NLPublicKey() string {
+	tb := n.env.t
+	tb.Helper()
+	cmd := n.Tailscale("lock", "status", "--json")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		tb.Fatalf("running `tailscale lock status`: %v, %s", err, out)
+	}
+	st := struct {
+		PublicKey string `json:"PublicKey"`
+	}{}
+	if err := json.Unmarshal(out, &st); err != nil {
+		tb.Fatalf("decoding `tailscale lock status` JSON: %v\njson:\n%s", err, out)
+	}
+	return st.PublicKey
+}
+
 // trafficTrap is an HTTP proxy handler to note whether any
 // HTTP traffic tries to leave localhost from tailscaled. We don't
 // expect any, so any request triggers a failure.
@@ -1098,21 +1142,44 @@ func (tt *trafficTrap) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 type authURLParserWriter struct {
+	t   *testing.T
 	buf bytes.Buffer
-	fn  func(urlStr string) error
+	// Handle login URLs, and count how many times they were seen
+	authURLFn func(urlStr string) error
+	// Handle machine approval URLs, and count how many times they were seen.
+	deviceApprovalURLFn func(urlStr string) error
 }
 
+// Note: auth URLs from testcontrol look slightly different to real auth URLs,
+// e.g. http://127.0.0.1:60456/auth/96af2ff7e04ae1499a9a
 var authURLRx = regexp.MustCompile(`(https?://\S+/auth/\S+)`)
 
+// Looks for any device approval URL, which is any URL ending with `/admin`
+// e.g. http://127.0.0.1:60456/admin
+var deviceApprovalURLRx = regexp.MustCompile(`(https?://\S+/admin)[^\S]`)
+
 func (w *authURLParserWriter) Write(p []byte) (n int, err error) {
+	w.t.Helper()
+	w.t.Logf("received bytes: %s", string(p))
 	n, err = w.buf.Write(p)
+
+	defer w.buf.Reset() // so it's not matched again
+
 	m := authURLRx.FindSubmatch(w.buf.Bytes())
 	if m != nil {
 		urlStr := string(m[1])
-		w.buf.Reset() // so it's not matched again
-		if err := w.fn(urlStr); err != nil {
+		if err := w.authURLFn(urlStr); err != nil {
 			return 0, err
 		}
 	}
+
+	m = deviceApprovalURLRx.FindSubmatch(w.buf.Bytes())
+	if m != nil && w.deviceApprovalURLFn != nil {
+		urlStr := string(m[1])
+		if err := w.deviceApprovalURLFn(urlStr); err != nil {
+			return 0, err
+		}
+	}
+
 	return n, err
 }
